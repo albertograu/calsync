@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from .config import Settings
 from .database import DatabaseManager, CalendarMappingDB
-from .models import CalendarInfo, CalendarMapping, EventSource
+from .models import CalendarInfo, CalendarMapping, CalendarPair, EventSource
 from .services import GoogleCalendarService, iCloudCalendarService
 
 logger = logging.getLogger(__name__)
@@ -72,40 +72,146 @@ class CalendarManager:
     def get_configured_mappings(self) -> List[CalendarMapping]:
         """Get calendar mappings from configuration.
         
+        NOTE: This method is DEPRECATED and only supports legacy configurations.
+        New configurations should use explicit calendar_pairs instead.
+        
         Returns:
             List of calendar mappings from config
         """
         mappings = []
         
-        # Convert from config format
-        for mapping_config in self.settings.sync_config.calendar_mappings:
-            mappings.append(mapping_config)
+        # Priority 1: Use explicit calendar pairs (new format)
+        if self.settings.sync_config.has_explicit_pairs():
+            self.logger.info("Using explicit calendar pairs from configuration")
+            # Convert CalendarPair to CalendarMapping for backward compatibility
+            for pair in self.settings.sync_config.get_active_pairs():
+                mapping = CalendarMapping(
+                    google_calendar_id=pair.google_calendar_id,
+                    icloud_calendar_id=pair.icloud_calendar_id,
+                    google_calendar_name=pair.google_calendar_name,
+                    icloud_calendar_name=pair.icloud_calendar_name,
+                    bidirectional=pair.bidirectional,
+                    sync_direction=pair.sync_direction,
+                    enabled=pair.enabled,
+                    conflict_resolution=pair.conflict_resolution
+                )
+                mappings.append(mapping)
+            return mappings
         
-        # Legacy support: convert old-style selections to mappings
-        if (not mappings and 
-            (self.settings.sync_config.selected_google_calendars or 
-             self.settings.sync_config.selected_icloud_calendars)):
+        # Priority 2: Convert legacy calendar_mappings
+        if self.settings.sync_config.calendar_mappings:
+            self.logger.warning("Using legacy calendar_mappings - consider upgrading to calendar_pairs")
+            mappings.extend(self.settings.sync_config.calendar_mappings)
+            return mappings
+        
+        # Priority 3: Legacy selected_* lists (DEPRECATED - cross product eliminated!)
+        if (self.settings.sync_config.selected_google_calendars or 
+            self.settings.sync_config.selected_icloud_calendars):
+            
+            self.logger.warning(
+                "DEPRECATED: selected_google_calendars/selected_icloud_calendars are deprecated. "
+                "Cross-product sync has been eliminated. Only 1:1 pairing is supported. "
+                "Please migrate to explicit calendar_pairs configuration."
+            )
             
             google_cals = self.settings.sync_config.selected_google_calendars or ["primary"]
             icloud_cals = self.settings.sync_config.selected_icloud_calendars or []
             
-            # Create 1:1 mappings if both lists have same length
+            # ONLY create 1:1 mappings - NO cross product!
             if len(google_cals) == len(icloud_cals):
+                self.logger.info(f"Creating {len(google_cals)} 1:1 calendar pairs from legacy config")
                 for g_cal, i_cal in zip(google_cals, icloud_cals):
                     mappings.append(CalendarMapping(
                         google_calendar_id=g_cal,
                         icloud_calendar_id=i_cal
                     ))
             else:
-                # Otherwise map all to primary
-                primary_google = google_cals[0] if google_cals else "primary"
-                for i_cal in icloud_cals:
-                    mappings.append(CalendarMapping(
-                        google_calendar_id=primary_google,
-                        icloud_calendar_id=i_cal
-                    ))
+                raise ValueError(
+                    f"Legacy configuration error: Cannot create cross-product mappings. "
+                    f"Found {len(google_cals)} Google calendars and {len(icloud_cals)} iCloud calendars. "
+                    f"Please configure explicit calendar_pairs with 1:1 relationships."
+                )
         
         return mappings
+    
+    def create_calendar_pair(
+        self,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        name: Optional[str] = None,
+        bidirectional: bool = True,
+        sync_direction: Optional[str] = None,
+        enabled: bool = True
+    ) -> CalendarPair:
+        """Create a new calendar pair configuration.
+        
+        Args:
+            google_calendar_id: Google calendar ID
+            icloud_calendar_id: iCloud calendar ID  
+            name: Human-readable name for the pair
+            bidirectional: Whether sync is bidirectional
+            sync_direction: Sync direction if not bidirectional
+            enabled: Whether the pair is enabled
+            
+        Returns:
+            New CalendarPair instance
+        """
+        return CalendarPair(
+            name=name,
+            google_calendar_id=google_calendar_id,
+            icloud_calendar_id=icloud_calendar_id,
+            bidirectional=bidirectional,
+            sync_direction=sync_direction,
+            enabled=enabled
+        )
+    
+    def validate_pairs_configuration(self, pairs: List[CalendarPair]) -> List[str]:
+        """Validate calendar pairs configuration.
+        
+        Args:
+            pairs: List of calendar pairs to validate
+            
+        Returns:
+            List of validation errors (empty if valid)
+        """
+        errors = []
+        
+        google_ids = []
+        icloud_ids = []
+        
+        for i, pair in enumerate(pairs):
+            if not pair.enabled:
+                continue
+                
+            # Check for duplicate Google calendar IDs
+            if pair.google_calendar_id in google_ids:
+                errors.append(
+                    f"Pair {i+1}: Google calendar '{pair.google_calendar_id}' "
+                    "is already used in another pair"
+                )
+            else:
+                google_ids.append(pair.google_calendar_id)
+            
+            # Check for duplicate iCloud calendar IDs
+            if pair.icloud_calendar_id in icloud_ids:
+                errors.append(
+                    f"Pair {i+1}: iCloud calendar '{pair.icloud_calendar_id}' "
+                    "is already used in another pair"
+                )
+            else:
+                icloud_ids.append(pair.icloud_calendar_id)
+            
+            # Validate sync direction
+            if not pair.bidirectional and not pair.sync_direction:
+                errors.append(
+                    f"Pair {i+1}: sync_direction must be specified when bidirectional=False"
+                )
+            elif not pair.bidirectional and pair.sync_direction not in ['google_to_icloud', 'icloud_to_google']:
+                errors.append(
+                    f"Pair {i+1}: invalid sync_direction '{pair.sync_direction}'"
+                )
+        
+        return errors
     
     async def auto_match_calendars(
         self,

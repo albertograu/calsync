@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import httpx
 import pytz
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .base import BaseCalendarService, CalendarServiceError, AuthenticationError, EventNotFoundError
 from ..models import CalendarEvent, CalendarInfo, EventSource
@@ -149,6 +150,11 @@ class GoogleCalendarService(BaseCalendarService):
         
         raise CalendarServiceError("No Google calendars found")
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((HttpError, CalendarServiceError))
+    )
     async def get_events(
         self,
         calendar_id: str,
@@ -190,11 +196,17 @@ class GoogleCalendarService(BaseCalendarService):
                 if page_token:
                     params['pageToken'] = page_token
                 
-                # Execute API call
-                events_result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.service.events().list(**params).execute()
-                )
+                # Execute API call with rate limit handling
+                try:
+                    events_result = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.service.events().list(**params).execute()
+                    )
+                except HttpError as e:
+                    if e.resp.status == 429:  # Rate limited
+                        self.logger.warning("Google API rate limited, retrying...")
+                        raise CalendarServiceError(f"Rate limited: {e}")
+                    raise
                 
                 # Process events
                 for event_data in events_result.get('items', []):
@@ -244,6 +256,11 @@ class GoogleCalendarService(BaseCalendarService):
         except Exception as e:
             raise CalendarServiceError(f"Failed to get Google event: {e}")
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((HttpError, CalendarServiceError))
+    )
     async def create_event(
         self,
         calendar_id: str,
@@ -327,10 +344,17 @@ class GoogleCalendarService(BaseCalendarService):
         # Check if it's an all-day event
         all_day = 'date' in start
         
+        timezone = None
         if all_day:
-            start_dt = datetime.fromisoformat(start['date']).replace(tzinfo=pytz.UTC)
-            end_dt = datetime.fromisoformat(end['date']).replace(tzinfo=pytz.UTC)
+            # For all-day events, keep date format without timezone conversion
+            start_dt = datetime.fromisoformat(start['date'])
+            end_dt = datetime.fromisoformat(end['date'])
         else:
+            # Extract timezone from dateTime
+            start_tz_str = start.get('timeZone')
+            if start_tz_str:
+                timezone = start_tz_str
+            
             start_dt = datetime.fromisoformat(start['dateTime'].replace('Z', '+00:00'))
             end_dt = datetime.fromisoformat(end['dateTime'].replace('Z', '+00:00'))
         
@@ -344,8 +368,17 @@ class GoogleCalendarService(BaseCalendarService):
                 'organizer': attendee.get('organizer', False)
             })
         
+        # Extract recurrence information
+        recurrence_rule = None
+        if 'recurrence' in event_data and event_data['recurrence']:
+            recurrence_rule = event_data['recurrence'][0]  # First RRULE
+        
+        # Generate or use UID - Google events use iCalUID for deduplication
+        uid = event_data.get('iCalUID', f"google-{event_data['id']}")
+        
         return CalendarEvent(
             id=event_data['id'],
+            uid=uid,
             source=EventSource.GOOGLE,
             summary=event_data.get('summary', ''),
             description=event_data.get('description', ''),
@@ -353,10 +386,13 @@ class GoogleCalendarService(BaseCalendarService):
             start=start_dt,
             end=end_dt,
             all_day=all_day,
+            timezone=timezone,
             created=datetime.fromisoformat(event_data['created'].replace('Z', '+00:00')),
             updated=datetime.fromisoformat(event_data['updated'].replace('Z', '+00:00')),
             etag=event_data.get('etag'),
+            sequence=event_data.get('sequence', 0),
             recurring_event_id=event_data.get('recurringEventId'),
+            recurrence_rule=recurrence_rule,
             organizer=event_data.get('organizer'),
             attendees=attendees,
             original_data=event_data

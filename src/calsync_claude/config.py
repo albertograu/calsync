@@ -7,7 +7,7 @@ from typing import Optional, List
 from pydantic import Field, validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .models import ConflictResolution, SyncConfiguration
+from .models import ConflictResolution, SyncConfiguration, CalendarPair
 
 
 class Settings(BaseSettings):
@@ -248,3 +248,86 @@ RATE_LIMIT_REQUESTS_PER_MINUTE=300
     
     with open(path, 'w') as f:
         f.write(example_content)
+
+
+def migrate_legacy_config_to_pairs(settings: Settings) -> List[CalendarPair]:
+    """Migrate legacy configuration to explicit calendar pairs.
+    
+    Args:
+        settings: Current settings instance
+        
+    Returns:
+        List of CalendarPair instances created from legacy config
+        
+    Raises:
+        ValueError: If legacy config cannot be migrated cleanly
+    """
+    pairs = []
+    
+    # If already has explicit pairs, return them
+    if settings.sync_config.has_explicit_pairs():
+        return settings.sync_config.get_active_pairs()
+    
+    # If has legacy mappings, convert them
+    if settings.sync_config.calendar_mappings:
+        for mapping in settings.sync_config.calendar_mappings:
+            pair = mapping.to_calendar_pair()
+            pairs.append(pair)
+        return pairs
+    
+    # Convert legacy selected_* lists
+    if (settings.sync_config.selected_google_calendars or 
+        settings.sync_config.selected_icloud_calendars):
+        
+        google_cals = settings.sync_config.selected_google_calendars or ["primary"]
+        icloud_cals = settings.sync_config.selected_icloud_calendars or []
+        
+        if len(google_cals) != len(icloud_cals):
+            raise ValueError(
+                f"Cannot migrate legacy config: {len(google_cals)} Google calendars "
+                f"and {len(icloud_cals)} iCloud calendars. Cross-product sync is no longer "
+                "supported. Please manually create explicit calendar_pairs with 1:1 relationships."
+            )
+        
+        for i, (g_cal, i_cal) in enumerate(zip(google_cals, icloud_cals)):
+            pair = CalendarPair(
+                name=f"Migrated Pair {i+1}",
+                google_calendar_id=g_cal,
+                icloud_calendar_id=i_cal,
+                bidirectional=True,
+                enabled=True
+            )
+            pairs.append(pair)
+    
+    return pairs
+
+
+def generate_pairs_config_example() -> str:
+    """Generate an example configuration for calendar pairs."""
+    return '''
+# Example calendar pairs configuration
+calendar_pairs = [
+    {
+        name = "Work Calendars"
+        google_calendar_id = "your.work@gmail.com"
+        icloud_calendar_id = "https://caldav.icloud.com/published/2/workCalendar"
+        bidirectional = true
+        enabled = true
+    },
+    {
+        name = "Personal Calendars"  
+        google_calendar_id = "primary"
+        icloud_calendar_id = "https://caldav.icloud.com/published/2/personalCalendar"
+        bidirectional = true
+        enabled = true
+    },
+    {
+        name = "One-way Sync (Google → iCloud)"
+        google_calendar_id = "shared.calendar@gmail.com"
+        icloud_calendar_id = "https://caldav.icloud.com/published/2/sharedCalendar"
+        bidirectional = false
+        sync_direction = "google_to_icloud"
+        enabled = true
+    }
+]
+'''

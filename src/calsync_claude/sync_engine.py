@@ -53,6 +53,17 @@ class ConflictResolver:
         if self.strategy == ConflictResolution.MANUAL:
             return None, "Manual resolution required"
         
+        # First try sequence-based resolution (preferred for iCal events)
+        google_seq = google_event.sequence or 0
+        icloud_seq = icloud_event.sequence or 0
+        
+        if google_seq != icloud_seq:
+            if google_seq > icloud_seq:
+                return google_event, f"Google event has higher sequence ({google_seq} > {icloud_seq})"
+            else:
+                return icloud_event, f"iCloud event has higher sequence ({icloud_seq} > {google_seq})"
+        
+        # Fallback to timestamp-based resolution
         elif self.strategy == ConflictResolution.LATEST_WINS:
             if google_event.updated > icloud_event.updated:
                 return google_event, "Google event is more recent"
@@ -313,21 +324,40 @@ class SyncEngine:
         time_min = now - timedelta(days=self.settings.sync_config.sync_past_days)
         time_max = now + timedelta(days=self.settings.sync_config.sync_future_days)
         
-        # Get events from both calendars
+        # Get last sync time for incremental sync
+        last_sync_time = None
+        with self.db_manager.get_session() as session:
+            last_session = session.query(SyncSessionDB).filter(
+                SyncSessionDB.calendar_mapping_id == calendar_mapping.id,
+                SyncSessionDB.status == 'completed'
+            ).order_by(SyncSessionDB.completed_at.desc()).first()
+            
+            if last_session:
+                last_sync_time = last_session.completed_at
+        
+        # Get events from both calendars with incremental sync support
         google_events = {}
         icloud_events = {}
+        google_events_by_uid = {}
+        icloud_events_by_uid = {}
         
         async for event in self.google_service.get_events(
-            google_calendar_id, time_min, time_max, 
-            max_results=self.settings.sync_config.max_events_per_sync
+            google_calendar_id, time_min, time_max,
+            max_results=self.settings.sync_config.max_events_per_sync,
+            updated_min=last_sync_time  # Only get events updated since last sync
         ):
             google_events[event.id] = event
+            if event.uid:
+                google_events_by_uid[event.uid] = event
         
         async for event in self.icloud_service.get_events(
             icloud_calendar_id, time_min, time_max,
-            max_results=self.settings.sync_config.max_events_per_sync
+            max_results=self.settings.sync_config.max_events_per_sync,
+            updated_min=last_sync_time  # Only get events updated since last sync
         ):
             icloud_events[event.id] = event
+            if event.uid:
+                icloud_events_by_uid[event.uid] = event
         
         self.logger.info(
             f"Found {len(google_events)} Google events, {len(icloud_events)} iCloud events"
@@ -346,17 +376,20 @@ class SyncEngine:
         processed_google = set()
         processed_icloud = set()
         
-        # Check sync direction and perform appropriate syncs
+        # Check sync direction and perform appropriate syncs with UID-based deduplication
         if calendar_mapping.bidirectional or calendar_mapping.sync_direction == 'google_to_icloud':
             # Process Google -> iCloud sync
             for google_event in google_events.values():
                 if google_event.id in processed_google:
                     continue
                 
-                await self._sync_event_to_target(
-                    google_event, EventSource.ICLOUD, icloud_calendar_id,
-                    calendar_mapping, mappings_by_google, sync_session, sync_report, dry_run
-                )
+                # Check if event should be synced (UID-based deduplication)
+                if google_event.should_sync_to_calendar(icloud_calendar_id, icloud_events):
+                    await self._sync_event_to_target(
+                        google_event, EventSource.ICLOUD, icloud_calendar_id,
+                        calendar_mapping, mappings_by_google, sync_session, sync_report, dry_run,
+                        target_events_by_uid=icloud_events_by_uid
+                    )
                 processed_google.add(google_event.id)
         
         if calendar_mapping.bidirectional or calendar_mapping.sync_direction == 'icloud_to_google':
@@ -365,10 +398,13 @@ class SyncEngine:
                 if icloud_event.id in processed_icloud:
                     continue
                 
-                await self._sync_event_to_target(
-                    icloud_event, EventSource.GOOGLE, google_calendar_id,
-                    calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run
-                )
+                # Check if event should be synced (UID-based deduplication)
+                if icloud_event.should_sync_to_calendar(google_calendar_id, google_events):
+                    await self._sync_event_to_target(
+                        icloud_event, EventSource.GOOGLE, google_calendar_id,
+                        calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run,
+                        target_events_by_uid=google_events_by_uid
+                    )
                 processed_icloud.add(icloud_event.id)
         
         # Handle deletions (events that exist in mapping but not in source)
@@ -387,7 +423,8 @@ class SyncEngine:
         mappings: Dict[str, EventMappingDB],
         sync_session: SyncSessionDB,
         sync_report: SyncReport,
-        dry_run: bool
+        dry_run: bool,
+        target_events_by_uid: Optional[Dict[str, CalendarEvent]] = None
     ) -> None:
         """Sync a single event to the target service.
         
@@ -395,10 +432,12 @@ class SyncEngine:
             source_event: Source event to sync
             target_source: Target service
             target_calendar_id: Target calendar ID
+            calendar_mapping: Calendar mapping from database
             mappings: Existing event mappings
             sync_session: Database sync session
             sync_report: Sync report to update
             dry_run: Whether this is a dry run
+            target_events_by_uid: Target events indexed by UID
         """
         try:
             target_service = (

@@ -15,9 +15,9 @@ from rich.prompt import Confirm, Prompt
 from rich.tree import Tree
 import structlog
 
-from .config import Settings, load_settings, create_example_config
+from .config import Settings, load_settings, create_example_config, migrate_legacy_config_to_pairs, generate_pairs_config_example
 from .sync_engine import SyncEngine
-from .models import ConflictResolution
+from .models import ConflictResolution, CalendarPair
 from .database import DatabaseManager
 
 console = Console()
@@ -72,8 +72,11 @@ def async_command(*args, **kwargs):
 def cli(ctx, config, debug, verbose):
     """CalSync Claude - Advanced two-way calendar synchronization.
     
-    Synchronize events between Google Calendar and iCloud with advanced
-    conflict resolution, async operations, and comprehensive monitoring.
+    Now uses explicit one-to-one calendar pairs (no more cross-product sync).
+    Use 'calsync-claude pairs' to configure and manage your calendar pairings.
+    
+    Features: UID-based deduplication, incremental sync, proper timezone handling,
+    sequence-based conflict resolution, and rate limiting with retries.
     """
     ctx.ensure_object(dict)
     
@@ -847,6 +850,160 @@ def _display_test_results(connection_results, google_calendars, icloud_calendars
         console.print(icloud_tree)
     else:
         console.print("[dim]No iCloud calendars found[/dim]")
+
+
+@cli.command()
+@click.option('--list', 'list_pairs', is_flag=True, help='List current calendar pairs')
+@click.option('--validate', is_flag=True, help='Validate calendar pairs configuration')
+@click.option('--migrate', is_flag=True, help='Migrate legacy configuration to calendar pairs')
+@click.option('--example', is_flag=True, help='Show example calendar pairs configuration')
+def pairs(list_pairs, validate, migrate, example):
+    """Manage explicit calendar pairs (replaces cross-product sync)."""
+    
+    if example:
+        console.print(Panel(
+            generate_pairs_config_example(),
+            title="Calendar Pairs Configuration Example",
+            border_style="blue"
+        ))
+        return
+    
+    try:
+        settings = load_settings()
+        
+        if migrate:
+            console.print("[bold]Migrating legacy configuration to calendar pairs...[/bold]\n")
+            
+            try:
+                pairs = migrate_legacy_config_to_pairs(settings)
+                
+                if not pairs:
+                    console.print("[yellow]No legacy configuration found to migrate.[/yellow]")
+                    console.print("Consider creating explicit calendar pairs using the --example option.")
+                    return
+                
+                console.print(f"[green]Successfully migrated {len(pairs)} calendar pairs![/green]\n")
+                
+                # Display migrated pairs
+                for i, pair in enumerate(pairs):
+                    console.print(f"[bold]Pair {i+1}:[/bold] {pair}")
+                    console.print(f"  Google: {pair.google_calendar_id}")
+                    console.print(f"  iCloud: {pair.icloud_calendar_id}")
+                    console.print(f"  Direction: {'↔ Bidirectional' if pair.bidirectional else f'→ {pair.sync_direction}'}")
+                    console.print(f"  Status: {'✅ Enabled' if pair.enabled else '❌ Disabled'}\n")
+                
+                console.print(Panel(
+                    "Add these pairs to your configuration file under [sync_config.calendar_pairs]\n"
+                    "and remove any legacy selected_google_calendars/selected_icloud_calendars settings.",
+                    title="Migration Instructions",
+                    border_style="green"
+                ))
+                
+            except ValueError as e:
+                console.print(Panel(
+                    str(e),
+                    title="Migration Error",
+                    border_style="red"
+                ))
+                return
+            
+        elif validate:
+            if not settings.sync_config.has_explicit_pairs():
+                console.print("[yellow]No explicit calendar pairs configured.[/yellow]")
+                console.print("Use --migrate to convert legacy configuration or --example for configuration format.")
+                return
+            
+            console.print("[bold]Validating calendar pairs configuration...[/bold]\n")
+            
+            async def run_validation():
+                async with SyncEngine(settings) as sync_engine:
+                    errors = sync_engine.calendar_manager.validate_pairs_configuration(
+                        settings.sync_config.get_active_pairs()
+                    )
+                    
+                    if errors:
+                        console.print("[red]Validation failed with the following errors:[/red]\n")
+                        for error in errors:
+                            console.print(f"  ❌ {error}")
+                        console.print()
+                    else:
+                        console.print("[green]✅ All calendar pairs are valid![/green]\n")
+                    
+                    return len(errors) == 0
+            
+            valid = asyncio.run(run_validation())
+            
+            if not valid:
+                console.print(Panel(
+                    "Fix the validation errors above and run --validate again.",
+                    title="Validation Failed",
+                    border_style="red"
+                ))
+                return
+        
+        elif list_pairs:
+            if not settings.sync_config.has_explicit_pairs():
+                console.print("[yellow]No explicit calendar pairs configured.[/yellow]")
+                
+                # Check for legacy config
+                if (settings.sync_config.selected_google_calendars or 
+                    settings.sync_config.selected_icloud_calendars or 
+                    settings.sync_config.calendar_mappings):
+                    console.print("Legacy configuration detected. Use --migrate to convert to explicit pairs.")
+                else:
+                    console.print("Use --example to see configuration format.")
+                return
+            
+            pairs = settings.sync_config.get_active_pairs()
+            
+            console.print(f"[bold]Configured Calendar Pairs ({len(pairs)} pairs)[/bold]\n")
+            
+            table = Table(show_header=True, header_style="bold magenta", title="Calendar Pairs")
+            table.add_column("Name", style="cyan")
+            table.add_column("Google Calendar")
+            table.add_column("iCloud Calendar")
+            table.add_column("Direction", justify="center")
+            table.add_column("Status", justify="center")
+            
+            for pair in pairs:
+                name = pair.name or f"Pair {pair.google_calendar_id[:8]}→{pair.icloud_calendar_id[:8]}"
+                google_cal = pair.google_calendar_name or pair.google_calendar_id
+                icloud_cal = pair.icloud_calendar_name or pair.icloud_calendar_id[:50] + ("..." if len(pair.icloud_calendar_id) > 50 else "")
+                
+                if pair.bidirectional:
+                    direction = "↔"
+                elif pair.sync_direction == "google_to_icloud":
+                    direction = "→"
+                else:
+                    direction = "←"
+                
+                status = "[green]✅ Enabled[/green]" if pair.enabled else "[red]❌ Disabled[/red]"
+                
+                table.add_row(name, google_cal, icloud_cal, direction, status)
+            
+            console.print(table)
+        
+        else:
+            # Default: show configuration status
+            if settings.sync_config.has_explicit_pairs():
+                pairs = settings.sync_config.get_active_pairs()
+                console.print(f"[green]✅ Using explicit calendar pairs ({len(pairs)} configured)[/green]")
+                console.print("Use --list to view all pairs or --validate to check configuration.")
+            else:
+                console.print("[yellow]⚠️  No explicit calendar pairs configured[/yellow]")
+                if (settings.sync_config.selected_google_calendars or 
+                    settings.sync_config.selected_icloud_calendars or 
+                    settings.sync_config.calendar_mappings):
+                    console.print("[yellow]Legacy configuration detected. Use --migrate to convert.[/yellow]")
+                else:
+                    console.print("Use --example to see configuration format.")
+    
+    except Exception as e:
+        console.print(Panel(
+            f"Error: {e}",
+            title="Configuration Error",
+            border_style="red"
+        ))
 
 
 def main():

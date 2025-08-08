@@ -10,6 +10,8 @@ import caldav
 from caldav import DAVClient
 import pytz
 from dateutil.parser import parse as parse_date
+from icalendar import Calendar, Event as ICalEvent
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .base import BaseCalendarService, CalendarServiceError, AuthenticationError, EventNotFoundError
 from ..models import CalendarEvent, CalendarInfo, EventSource
@@ -117,6 +119,11 @@ class iCloudCalendarService(BaseCalendarService):
         
         raise CalendarServiceError("No iCloud calendars found")
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=8, max=60),  # More aggressive backoff for iCloud
+        retry=retry_if_exception_type(CalendarServiceError)
+    )
     async def get_events(
         self,
         calendar_id: str,
@@ -144,11 +151,17 @@ class iCloudCalendarService(BaseCalendarService):
             if not calendar:
                 raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
             
-            # Get events from CalDAV
-            events = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: calendar.date_search(start=time_min, end=time_max)
-            )
+            # Get events from CalDAV with throttling detection
+            try:
+                events = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.date_search(start=time_min, end=time_max)
+                )
+            except Exception as e:
+                if "429" in str(e) or "throttl" in str(e).lower():
+                    self.logger.warning("iCloud CalDAV throttled, retrying with backoff...")
+                    raise CalendarServiceError(f"iCloud throttled: {e}")
+                raise CalendarServiceError(f"Failed to get iCloud events: {e}")
             
             events_yielded = 0
             for event in events:
@@ -202,6 +215,11 @@ class iCloudCalendarService(BaseCalendarService):
         except Exception as e:
             raise CalendarServiceError(f"Failed to get iCloud event: {e}")
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=8, max=60),
+        retry=retry_if_exception_type(CalendarServiceError)
+    )
     async def create_event(
         self,
         calendar_id: str,
@@ -319,47 +337,93 @@ class iCloudCalendarService(BaseCalendarService):
         return None
     
     def _parse_caldav_event(self, event) -> Optional[CalendarEvent]:
-        """Parse CalDAV event to standardized format."""
+        """Parse CalDAV event to standardized format using proper iCal parser."""
         try:
-            # Get the iCal data
-            ical_data = event.data
+            # Parse the iCal data with icalendar library
+            cal = Calendar.from_ical(event.data)
             
-            # Parse basic fields using regex
-            summary = self._extract_ical_field(ical_data, 'SUMMARY') or ''
-            description = self._extract_ical_field(ical_data, 'DESCRIPTION') or ''
-            location = self._extract_ical_field(ical_data, 'LOCATION') or ''
+            # Find the VEVENT component
+            vevent = None
+            for component in cal.walk():
+                if component.name == "VEVENT":
+                    vevent = component
+                    break
             
-            # Parse dates
-            dtstart = self._extract_ical_field(ical_data, 'DTSTART')
-            dtend = self._extract_ical_field(ical_data, 'DTEND')
-            created = self._extract_ical_field(ical_data, 'CREATED')
-            last_modified = self._extract_ical_field(ical_data, 'LAST-MODIFIED')
+            if not vevent:
+                return None
+            
+            # Extract basic fields
+            summary = str(vevent.get('summary', ''))
+            description = str(vevent.get('description', ''))
+            location = str(vevent.get('location', ''))
+            
+            # Extract UID
+            uid = str(vevent.get('uid', str(hash(event.data))))
+            
+            # Parse dates with proper timezone handling
+            dtstart = vevent.get('dtstart')
+            dtend = vevent.get('dtend')
             
             if not dtstart:
                 return None
             
-            # Parse start and end times
-            start_dt, all_day_start = self._parse_ical_datetime(dtstart)
-            end_dt, all_day_end = self._parse_ical_datetime(dtend) if dtend else (None, False)
+            start_dt = dtstart.dt
+            all_day = not isinstance(start_dt, datetime)
             
-            # If no end time, assume duration
-            if not end_dt:
-                if all_day_start:
+            # Handle timezone extraction
+            timezone = None
+            if not all_day and hasattr(start_dt, 'tzinfo') and start_dt.tzinfo:
+                timezone = str(start_dt.tzinfo)
+            
+            # Convert to datetime and handle all-day events
+            if all_day:
+                # Keep date format for all-day events
+                start_dt = datetime.combine(start_dt, datetime.min.time())
+                if dtend:
+                    end_dt = datetime.combine(dtend.dt, datetime.min.time())
+                else:
                     end_dt = start_dt + timedelta(days=1)
+            else:
+                # Ensure timezone-aware datetimes
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=pytz.UTC)
+                if dtend:
+                    end_dt = dtend.dt
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=pytz.UTC)
                 else:
                     end_dt = start_dt + timedelta(hours=1)
             
-            all_day = all_day_start or all_day_end
-            
             # Parse timestamps
-            created_dt = self._parse_ical_datetime(created)[0] if created else datetime.now(pytz.UTC)
-            updated_dt = self._parse_ical_datetime(last_modified)[0] if last_modified else created_dt
+            created_prop = vevent.get('created')
+            created_dt = created_prop.dt if created_prop else datetime.now(pytz.UTC)
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=pytz.UTC)
             
-            # Extract UID
-            uid = self._extract_ical_field(ical_data, 'UID') or str(hash(ical_data))
+            last_modified_prop = vevent.get('last-modified')
+            updated_dt = last_modified_prop.dt if last_modified_prop else created_dt
+            if updated_dt.tzinfo is None:
+                updated_dt = updated_dt.replace(tzinfo=pytz.UTC)
+            
+            # Extract sequence for conflict resolution
+            sequence = int(vevent.get('sequence', 0))
+            
+            # Extract recurrence information
+            rrule = vevent.get('rrule')
+            recurrence_rule = str(rrule) if rrule else None
+            
+            # Extract recurrence overrides (RDATE, EXDATE)
+            recurrence_overrides = []
+            for prop in ['rdate', 'exdate']:
+                if prop in vevent:
+                    recurrence_overrides.append({
+                        'type': prop,
+                        'dates': [str(d) for d in vevent[prop].to_ical().decode().split(',')]
+                    })
             
             return CalendarEvent(
                 id=uid,
+                uid=uid,
                 source=EventSource.ICLOUD,
                 summary=summary,
                 description=description,
@@ -367,75 +431,19 @@ class iCloudCalendarService(BaseCalendarService):
                 start=start_dt,
                 end=end_dt,
                 all_day=all_day,
+                timezone=timezone,
                 created=created_dt,
                 updated=updated_dt,
-                original_data={'caldav_event': event, 'ical_data': ical_data}
+                sequence=sequence,
+                recurrence_rule=recurrence_rule,
+                recurrence_overrides=recurrence_overrides,
+                original_data={'caldav_event': event, 'ical_data': event.data, 'vevent': vevent}
             )
             
         except Exception as e:
             self.logger.warning(f"Error parsing CalDAV event: {e}")
             return None
     
-    def _extract_ical_field(self, ical_data: str, field_name: str) -> Optional[str]:
-        """Extract a field value from iCal data."""
-        # Handle multi-line folding in iCal format
-        unfolded_data = re.sub(r'\r?\n[ \t]', '', ical_data)
-        
-        # Look for the field
-        pattern = rf'^{field_name}[^:]*:(.*)$'
-        match = re.search(pattern, unfolded_data, re.MULTILINE | re.IGNORECASE)
-        
-        if match:
-            value = match.group(1).strip()
-            # Unescape common iCal escapes
-            value = value.replace('\\n', '\n').replace('\\,', ',').replace('\\;', ';')
-            return value
-        
-        return None
-    
-    def _parse_ical_datetime(self, dt_string: str) -> tuple[datetime, bool]:
-        """Parse iCal datetime string."""
-        if not dt_string:
-            return datetime.now(pytz.UTC), False
-        
-        # Remove VALUE=DATE if present
-        dt_string = re.sub(r'VALUE=DATE[^:]*:', '', dt_string)
-        
-        # Check if it's a date-only (all-day) event
-        if re.match(r'^\d{8}$', dt_string):
-            # YYYYMMDD format (all-day)
-            dt = datetime.strptime(dt_string, '%Y%m%d')
-            return dt.replace(tzinfo=pytz.UTC), True
-        
-        # Try to parse as datetime
-        try:
-            # Remove timezone info for parsing
-            clean_dt = re.sub(r'TZID=[^:]*:', '', dt_string)
-            
-            if 'T' in clean_dt:
-                if clean_dt.endswith('Z'):
-                    # UTC time
-                    dt = datetime.strptime(clean_dt, '%Y%m%dT%H%M%SZ')
-                    return dt.replace(tzinfo=pytz.UTC), False
-                else:
-                    # Local time or timezone specified
-                    dt = datetime.strptime(clean_dt, '%Y%m%dT%H%M%S')
-                    return dt.replace(tzinfo=pytz.UTC), False
-            else:
-                # Date only
-                dt = datetime.strptime(clean_dt, '%Y%m%d')
-                return dt.replace(tzinfo=pytz.UTC), True
-                
-        except ValueError:
-            # Fallback: try dateutil parser
-            try:
-                dt = parse_date(dt_string)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=pytz.UTC)
-                return dt, 'T' not in dt_string
-            except:
-                # Last resort: current time
-                return datetime.now(pytz.UTC), False
     
     def _extract_uid_from_caldav_event(self, event) -> str:
         """Extract UID from CalDAV event."""
@@ -447,54 +455,78 @@ class iCloudCalendarService(BaseCalendarService):
             return str(hash(str(event)))
     
     def _create_ical_event(self, event_data: CalendarEvent) -> str:
-        """Create iCal format string from event data."""
-        # Generate a UID
-        uid = event_data.id or f"calsync-claude-{hash(str(event_data))}"
+        """Create iCal format string from event data using proper iCal library."""
+        # Create calendar and event components
+        cal = Calendar()
+        cal.add('prodid', '-//CalSync Claude//CalSync Claude 2.0//EN')
+        cal.add('version', '2.0')
         
-        # Format datetime
-        if event_data.all_day:
-            dtstart = event_data.start.strftime('%Y%m%d')
-            dtend = event_data.end.strftime('%Y%m%d')
-            dtstart_line = f"DTSTART;VALUE=DATE:{dtstart}"
-            dtend_line = f"DTEND;VALUE=DATE:{dtend}"
-        else:
-            dtstart = event_data.start.strftime('%Y%m%dT%H%M%SZ')
-            dtend = event_data.end.strftime('%Y%m%dT%H%M%SZ')
-            dtstart_line = f"DTSTART:{dtstart}"
-            dtend_line = f"DTEND:{dtend}"
+        event = ICalEvent()
         
-        # Escape iCal special characters
-        def escape_text(text):
-            if not text:
-                return ""
-            return text.replace('\\', '\\\\').replace(',', '\\,').replace(';', '\\;').replace('\n', '\\n')
+        # Use UID from event or generate one
+        uid = event_data.uid or event_data.id or f"calsync-claude-{hash(str(event_data))}"
+        event.add('uid', uid)
         
-        # Build iCal event
-        ical_lines = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            "PRODID:-//CalSync Claude//CalSync Claude 2.0//EN",
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            dtstart_line,
-            dtend_line,
-            f"SUMMARY:{escape_text(event_data.summary)}",
-        ]
-        
+        # Add basic properties
+        event.add('summary', event_data.summary)
         if event_data.description:
-            ical_lines.append(f"DESCRIPTION:{escape_text(event_data.description)}")
-        
+            event.add('description', event_data.description)
         if event_data.location:
-            ical_lines.append(f"LOCATION:{escape_text(event_data.location)}")
+            event.add('location', event_data.location)
+        
+        # Handle date/time properly
+        if event_data.all_day:
+            # All-day events use DATE format
+            event.add('dtstart', event_data.start.date())
+            event.add('dtend', event_data.end.date())
+        else:
+            # Timed events with timezone preservation
+            if event_data.timezone:
+                # Try to preserve original timezone
+                try:
+                    tz = pytz.timezone(event_data.timezone)
+                    start_local = event_data.start.astimezone(tz)
+                    end_local = event_data.end.astimezone(tz)
+                    event.add('dtstart', start_local)
+                    event.add('dtend', end_local)
+                except:
+                    # Fallback to UTC
+                    event.add('dtstart', event_data.start)
+                    event.add('dtend', event_data.end)
+            else:
+                event.add('dtstart', event_data.start)
+                event.add('dtend', event_data.end)
         
         # Add timestamps
-        now = datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')
-        ical_lines.extend([
-            f"DTSTAMP:{now}",
-            f"CREATED:{event_data.created.strftime('%Y%m%dT%H%M%SZ')}",
-            f"LAST-MODIFIED:{now}",
-            "END:VEVENT",
-            "END:VCALENDAR"
-        ])
+        now = datetime.now(pytz.UTC)
+        event.add('dtstamp', now)
+        event.add('created', event_data.created)
+        event.add('last-modified', now)
         
-        return '\r\n'.join(ical_lines)
+        # Add sequence for conflict resolution
+        if event_data.sequence is not None:
+            event.add('sequence', event_data.sequence)
+        
+        # Add recurrence rule if present
+        if event_data.recurrence_rule:
+            try:
+                # Parse and add RRULE
+                from icalendar.parser import from_ical
+                rrule = from_ical(event_data.recurrence_rule)
+                event.add('rrule', rrule)
+            except:
+                # If parsing fails, add as text
+                self.logger.warning(f"Failed to parse RRULE: {event_data.recurrence_rule}")
+        
+        # Add recurrence overrides
+        for override in event_data.recurrence_overrides:
+            if override['type'] in ['rdate', 'exdate']:
+                for date_str in override['dates']:
+                    try:
+                        date_val = parse_date(date_str)
+                        event.add(override['type'], date_val)
+                    except:
+                        continue
+        
+        cal.add_component(event)
+        return cal.to_ical().decode('utf-8')

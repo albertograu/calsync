@@ -38,6 +38,7 @@ class CalendarEvent(BaseModel):
     """Standardized calendar event model."""
     
     id: str = Field(..., description="Event ID from source service")
+    uid: Optional[str] = Field(None, description="Universal event UID (iCal UID for deduplication)")
     source: EventSource = Field(..., description="Source service")
     summary: str = Field("", description="Event title/summary")
     description: Optional[str] = Field(None, description="Event description")
@@ -45,10 +46,14 @@ class CalendarEvent(BaseModel):
     start: datetime = Field(..., description="Event start time")
     end: datetime = Field(..., description="Event end time")
     all_day: bool = Field(False, description="Whether event is all-day")
+    timezone: Optional[str] = Field(None, description="Original IANA timezone for non-all-day events")
     created: datetime = Field(default_factory=lambda: datetime.now(pytz.UTC))
     updated: datetime = Field(default_factory=lambda: datetime.now(pytz.UTC))
     etag: Optional[str] = Field(None, description="ETag for change detection")
+    sequence: Optional[int] = Field(None, description="iCal SEQUENCE field for conflict resolution")
     recurring_event_id: Optional[str] = Field(None, description="Recurring event ID")
+    recurrence_rule: Optional[str] = Field(None, description="RRULE for recurring events")
+    recurrence_overrides: List[Dict[str, Any]] = Field(default_factory=list, description="Recurrence exceptions/modifications")
     organizer: Optional[Dict[str, Any]] = Field(None, description="Event organizer info")
     attendees: List[Dict[str, Any]] = Field(default_factory=list, description="Event attendees")
     original_data: Optional[Dict[str, Any]] = Field(None, description="Original event data")
@@ -73,15 +78,33 @@ class CalendarEvent(BaseModel):
         import json
         
         content = {
+            'uid': self.uid,
             'summary': self.summary,
             'description': self.description or '',
             'location': self.location or '',
             'start': self.start.isoformat(),
             'end': self.end.isoformat(),
             'all_day': self.all_day,
+            'timezone': self.timezone,
+            'recurrence_rule': self.recurrence_rule,
         }
         content_str = json.dumps(content, sort_keys=True)
         return hashlib.sha256(content_str.encode()).hexdigest()
+    
+    def get_dedup_key(self) -> str:
+        """Get key for deduplication based on UID or content hash."""
+        return self.uid if self.uid else self.content_hash()
+    
+    def should_sync_to_calendar(self, target_calendar_id: str, existing_events: Dict[str, 'CalendarEvent']) -> bool:
+        """Check if this event should be synced to target calendar."""
+        dedup_key = self.get_dedup_key()
+        
+        # Check if an event with same UID already exists in target
+        for existing_event in existing_events.values():
+            if existing_event.get_dedup_key() == dedup_key:
+                return False  # Don't sync, duplicate exists
+        
+        return True
 
 
 class EventMapping(BaseModel):
@@ -164,8 +187,37 @@ class CalendarInfo(BaseModel):
     is_selected: bool = Field(True, description="Whether to sync this calendar")
 
 
+class CalendarPair(BaseModel):
+    """Explicit one-to-one calendar pairing configuration."""
+    
+    name: Optional[str] = Field(None, description="Human-readable name for this pair")
+    google_calendar_id: str = Field(..., description="Google calendar ID")
+    icloud_calendar_id: str = Field(..., description="iCloud calendar ID")
+    google_calendar_name: Optional[str] = Field(None, description="Google calendar name (auto-populated)")
+    icloud_calendar_name: Optional[str] = Field(None, description="iCloud calendar name (auto-populated)")
+    bidirectional: bool = Field(True, description="Whether sync is bidirectional")
+    sync_direction: Optional[str] = Field(None, description="Sync direction: 'google_to_icloud' or 'icloud_to_google'")
+    enabled: bool = Field(True, description="Whether this pair is enabled for sync")
+    conflict_resolution: Optional[ConflictResolution] = Field(None, description="Override global conflict resolution for this pair")
+    
+    @validator('sync_direction')
+    def validate_sync_direction(cls, v, values):
+        """Validate sync direction."""
+        if v is not None and not values.get('bidirectional', True):
+            valid_directions = ['google_to_icloud', 'icloud_to_google']
+            if v not in valid_directions:
+                raise ValueError(f'sync_direction must be one of {valid_directions}')
+        return v
+    
+    def __str__(self) -> str:
+        """String representation of the pair."""
+        name = self.name or f"Pair {self.google_calendar_id[:8]}→{self.icloud_calendar_id[:8]}"
+        direction = "↔" if self.bidirectional else ("→" if self.sync_direction == "google_to_icloud" else "←")
+        return f"{name} ({self.google_calendar_name or 'Google'} {direction} {self.icloud_calendar_name or 'iCloud'})"
+
+
 class CalendarMapping(BaseModel):
-    """Calendar mapping between Google and iCloud calendars."""
+    """DEPRECATED: Use CalendarPair instead. Maintained for backward compatibility."""
     
     google_calendar_id: str = Field(..., description="Google calendar ID")
     icloud_calendar_id: str = Field(..., description="iCloud calendar ID")
@@ -175,6 +227,19 @@ class CalendarMapping(BaseModel):
     sync_direction: Optional[str] = Field(None, description="Sync direction if not bidirectional")
     enabled: bool = Field(True, description="Whether this mapping is enabled")
     conflict_resolution: Optional[ConflictResolution] = Field(None, description="Override global conflict resolution")
+    
+    def to_calendar_pair(self) -> CalendarPair:
+        """Convert to new CalendarPair format."""
+        return CalendarPair(
+            google_calendar_id=self.google_calendar_id,
+            icloud_calendar_id=self.icloud_calendar_id,
+            google_calendar_name=self.google_calendar_name,
+            icloud_calendar_name=self.icloud_calendar_name,
+            bidirectional=self.bidirectional,
+            sync_direction=self.sync_direction,
+            enabled=self.enabled,
+            conflict_resolution=self.conflict_resolution
+        )
 
 
 class SyncConfiguration(BaseModel):
@@ -190,13 +255,35 @@ class SyncConfiguration(BaseModel):
     enable_webhooks: bool = Field(False)
     webhook_port: int = Field(8080, ge=1024, le=65535)
     
-    # Calendar mappings - replaces the simple ID lists
-    calendar_mappings: List[CalendarMapping] = Field(default_factory=list, description="Calendar mappings")
+    # Explicit calendar pairs - no cross product sync!
+    calendar_pairs: List[CalendarPair] = Field(default_factory=list, description="Explicit one-to-one calendar pairs")
     
-    # Auto-mapping settings
-    auto_create_calendars: bool = Field(False, description="Auto-create missing calendars")
-    calendar_name_mapping: Dict[str, str] = Field(default_factory=dict, description="Calendar name mappings")
+    # Auto-pairing settings (only used when no explicit pairs are configured)
+    auto_create_pairs: bool = Field(False, description="Auto-create pairs by matching calendar names")
+    name_matching_strategy: str = Field("exact", description="Name matching strategy: 'exact', 'fuzzy', or 'manual'")
     
-    # Legacy support (deprecated but maintained for backward compatibility)
-    selected_google_calendars: List[str] = Field(default_factory=list, description="Deprecated: use calendar_mappings")
-    selected_icloud_calendars: List[str] = Field(default_factory=list, description="Deprecated: use calendar_mappings")
+    # Legacy support (DEPRECATED - will be removed in v3.0)
+    calendar_mappings: List[CalendarMapping] = Field(default_factory=list, description="DEPRECATED: use calendar_pairs")
+    selected_google_calendars: List[str] = Field(default_factory=list, description="DEPRECATED: use calendar_pairs")
+    selected_icloud_calendars: List[str] = Field(default_factory=list, description="DEPRECATED: use calendar_pairs")
+    
+    @validator('calendar_pairs')
+    def validate_calendar_pairs(cls, v):
+        """Validate that calendar pairs don't have duplicate calendar IDs."""
+        google_ids = [pair.google_calendar_id for pair in v if pair.enabled]
+        icloud_ids = [pair.icloud_calendar_id for pair in v if pair.enabled]
+        
+        if len(google_ids) != len(set(google_ids)):
+            raise ValueError("Duplicate Google calendar IDs found in calendar pairs")
+        if len(icloud_ids) != len(set(icloud_ids)):
+            raise ValueError("Duplicate iCloud calendar IDs found in calendar pairs")
+        
+        return v
+    
+    def get_active_pairs(self) -> List[CalendarPair]:
+        """Get only enabled calendar pairs."""
+        return [pair for pair in self.calendar_pairs if pair.enabled]
+    
+    def has_explicit_pairs(self) -> bool:
+        """Check if explicit calendar pairs are configured."""
+        return bool(self.calendar_pairs)
