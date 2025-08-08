@@ -62,6 +62,13 @@ class CalendarMappingDB(Base):
     sync_direction = Column(String(20), nullable=True)  # 'google_to_icloud', 'icloud_to_google'
     enabled = Column(Boolean, nullable=False, default=True)
     conflict_resolution = Column(String(20), nullable=True)  # Override global setting
+    
+    # Sync tokens for incremental sync (CRITICAL for production)
+    google_sync_token = Column(String(1000), nullable=True)            # Google nextSyncToken
+    icloud_sync_token = Column(String(1000), nullable=True)            # iCloud CTag or sync-token
+    google_last_updated = Column(DateTime, nullable=True)              # Last successful Google sync
+    icloud_last_updated = Column(DateTime, nullable=True)              # Last successful iCloud sync
+    
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
     updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
     
@@ -76,17 +83,41 @@ class EventMappingDB(Base):
     
     id = Column(GUID(), primary_key=True, default=uuid4)
     calendar_mapping_id = Column(GUID(), ForeignKey('calendar_mappings.id'), nullable=False, index=True)
+    
+    # Event IDs (service-specific)
     google_event_id = Column(String(255), nullable=True, index=True)
     icloud_event_id = Column(String(255), nullable=True, index=True)
+    
+    # Calendar IDs  
     google_calendar_id = Column(String(255), nullable=True, index=True)
     icloud_calendar_id = Column(String(500), nullable=True, index=True)
+    
+    # UIDs for cross-platform matching (CRITICAL for production)
+    google_ical_uid = Column(String(255), nullable=True, index=True)  # Google's iCalUID
+    icloud_uid = Column(String(255), nullable=True, index=True)       # iCloud's UID
+    event_uid = Column(String(255), nullable=True, index=True)        # Canonical UID for deduplication
+    
+    # Resource paths for direct access (avoids scanning)
+    icloud_resource_url = Column(String(1000), nullable=True)         # Full CalDAV resource URL
+    google_self_link = Column(String(1000), nullable=True)            # Google API self link
+    
+    # ETags and versioning
     google_etag = Column(String(255), nullable=True)
     icloud_etag = Column(String(255), nullable=True)
+    google_sequence = Column(Integer, nullable=True, default=0)       # Google sequence number
+    icloud_sequence = Column(Integer, nullable=True, default=0)       # iCloud sequence number
+    
+    # Content tracking
     content_hash = Column(String(64), nullable=False, index=True)
+    
+    # Timestamps
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
     updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
     last_sync_at = Column(DateTime, nullable=True)
+    
+    # Sync metadata
     sync_direction = Column(String(20), nullable=True)  # 'google_to_icloud', 'icloud_to_google'
+    sync_status = Column(String(20), nullable=True, default='active')  # 'active', 'deleted', 'orphaned'
     
     # Relationships
     calendar_mapping = relationship("CalendarMappingDB", back_populates="event_mappings")

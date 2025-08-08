@@ -162,37 +162,49 @@ class GoogleCalendarService(BaseCalendarService):
         time_max: Optional[datetime] = None,
         max_results: Optional[int] = None,
         updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
     ) -> AsyncIterator[CalendarEvent]:
-        """Get events from Google calendar asynchronously."""
+        """Get events from Google calendar asynchronously with sync token support."""
         self._ensure_authenticated()
-        
-        # Set default time range if not specified
-        if time_min is None:
-            time_min = datetime.now(pytz.UTC) - timedelta(
-                days=self.settings.sync_config.sync_past_days
-            )
-        if time_max is None:
-            time_max = datetime.now(pytz.UTC) + timedelta(
-                days=self.settings.sync_config.sync_future_days
-            )
         
         try:
             page_token = None
             events_yielded = 0
+            next_sync_token = None
             
             while True:
                 # Build request parameters
                 params = {
                     'calendarId': calendar_id,
-                    'timeMin': time_min.isoformat(),
-                    'timeMax': time_max.isoformat(),
-                    'singleEvents': True,
-                    'orderBy': 'startTime',
                     'maxResults': min(250, max_results or 250)
                 }
                 
-                if updated_min:
-                    params['updatedMin'] = updated_min.isoformat()
+                # Use sync token for incremental sync if available
+                if sync_token:
+                    # Sync token mode - gets all changes since last sync
+                    params['syncToken'] = sync_token
+                    # Don't use time filters with sync tokens
+                else:
+                    # Time window mode - fallback for initial sync
+                    if time_min is None:
+                        time_min = datetime.now(pytz.UTC) - timedelta(
+                            days=self.settings.sync_config.sync_past_days
+                        )
+                    if time_max is None:
+                        time_max = datetime.now(pytz.UTC) + timedelta(
+                            days=self.settings.sync_config.sync_future_days
+                        )
+                    
+                    params.update({
+                        'timeMin': time_min.isoformat(),
+                        'timeMax': time_max.isoformat(),
+                        'singleEvents': True,
+                        'orderBy': 'startTime'
+                    })
+                    
+                    if updated_min:
+                        params['updatedMin'] = updated_min.isoformat()
+                
                 if page_token:
                     params['pageToken'] = page_token
                 
@@ -223,9 +235,14 @@ class GoogleCalendarService(BaseCalendarService):
                         )
                         continue
                 
-                # Check for next page
+                # Check for next page or sync token
                 page_token = events_result.get('nextPageToken')
+                next_sync_token = events_result.get('nextSyncToken')
+                
                 if not page_token:
+                    # Store the sync token for future incremental syncs
+                    if next_sync_token and hasattr(self, '_current_sync_token_callback'):
+                        self._current_sync_token_callback(next_sync_token)
                     break
                 
         except HttpError as e:
@@ -270,7 +287,8 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
-            google_event_data = self._convert_to_google_format(event_data)
+            # CRITICAL: Use custom event ID to prevent duplicates during initial sync
+            google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
             
             created_event = await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -398,13 +416,24 @@ class GoogleCalendarService(BaseCalendarService):
             original_data=event_data
         )
     
-    def _convert_to_google_format(self, event: CalendarEvent) -> Dict[str, Any]:
+    def _convert_to_google_format(self, event: CalendarEvent, use_event_id: bool = False) -> Dict[str, Any]:
         """Convert standard event format to Google Calendar format."""
         google_event = {
             'summary': event.summary,
             'description': event.description or '',
             'location': event.location or ''
         }
+        
+        # CRITICAL: Set custom event ID when we already have a UID to prevent duplicates
+        if use_event_id and event.uid:
+            # Use a deterministic ID based on the UID to prevent duplicates
+            import hashlib
+            event_id = hashlib.sha1(event.uid.encode()).hexdigest()[:32]
+            google_event['id'] = event_id
+        
+        # Set iCalUID for cross-platform matching
+        if event.uid:
+            google_event['iCalUID'] = event.uid
         
         if event.all_day:
             # All-day event
@@ -414,6 +443,14 @@ class GoogleCalendarService(BaseCalendarService):
             # Timed event
             google_event['start'] = {'dateTime': event.start.isoformat()}
             google_event['end'] = {'dateTime': event.end.isoformat()}
+        
+        # Add sequence for conflict resolution
+        if event.sequence is not None:
+            google_event['sequence'] = event.sequence
+        
+        # Add recurrence rule if present
+        if event.recurrence_rule:
+            google_event['recurrence'] = [event.recurrence_rule]
         
         # Add attendees if present
         if event.attendees:

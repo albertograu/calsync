@@ -131,6 +131,7 @@ class iCloudCalendarService(BaseCalendarService):
         time_max: Optional[datetime] = None,
         max_results: Optional[int] = None,
         updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
     ) -> AsyncIterator[CalendarEvent]:
         """Get events from iCloud calendar asynchronously."""
         self._ensure_authenticated()
@@ -151,12 +152,21 @@ class iCloudCalendarService(BaseCalendarService):
             if not calendar:
                 raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
             
-            # Get events from CalDAV with throttling detection
+            # Get events from CalDAV - use sync_token if available for incremental sync
             try:
-                events = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: calendar.date_search(start=time_min, end=time_max)
-                )
+                if sync_token:
+                    # TODO: Implement proper CalDAV sync-collection support
+                    # For now, fall back to date search with ctag comparison
+                    self.logger.warning("iCloud sync tokens not yet implemented, using date search")
+                    events = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: calendar.date_search(start=time_min, end=time_max)
+                    )
+                else:
+                    events = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: calendar.date_search(start=time_min, end=time_max)
+                    )
             except Exception as e:
                 if "429" in str(e) or "throttl" in str(e).lower():
                     self.logger.warning("iCloud CalDAV throttled, retrying with backoff...")
@@ -421,6 +431,9 @@ class iCloudCalendarService(BaseCalendarService):
                         'dates': [str(d) for d in vevent[prop].to_ical().decode().split(',')]
                     })
             
+            # Extract resource URL for direct access (CRITICAL for production)
+            resource_url = str(event.url) if hasattr(event, 'url') and event.url else None
+            
             return CalendarEvent(
                 id=uid,
                 uid=uid,
@@ -437,7 +450,12 @@ class iCloudCalendarService(BaseCalendarService):
                 sequence=sequence,
                 recurrence_rule=recurrence_rule,
                 recurrence_overrides=recurrence_overrides,
-                original_data={'caldav_event': event, 'ical_data': event.data, 'vevent': vevent}
+                original_data={
+                    'caldav_event': event, 
+                    'ical_data': event.data, 
+                    'vevent': vevent,
+                    'resource_url': resource_url  # Store for direct access
+                }
             )
             
         except Exception as e:

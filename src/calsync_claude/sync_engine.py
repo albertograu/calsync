@@ -341,23 +341,53 @@ class SyncEngine:
         google_events_by_uid = {}
         icloud_events_by_uid = {}
         
+        # Use sync tokens for true incremental sync if available
+        google_sync_token = calendar_mapping.google_sync_token
+        icloud_sync_token = calendar_mapping.icloud_sync_token
+        
+        # Store callbacks to capture new sync tokens
+        new_google_sync_token = None
+        new_icloud_sync_token = None
+        
+        def capture_google_token(token):
+            nonlocal new_google_sync_token
+            new_google_sync_token = token
+        
+        # Set callback for Google sync token capture  
+        self.google_service._current_sync_token_callback = capture_google_token
+        
         async for event in self.google_service.get_events(
-            google_calendar_id, time_min, time_max,
+            google_calendar_id, 
+            time_min=time_min if not google_sync_token else None,
+            time_max=time_max if not google_sync_token else None,
             max_results=self.settings.sync_config.max_events_per_sync,
-            updated_min=last_sync_time  # Only get events updated since last sync
+            sync_token=google_sync_token  # Use sync token for incremental sync
         ):
             google_events[event.id] = event
             if event.uid:
                 google_events_by_uid[event.uid] = event
         
         async for event in self.icloud_service.get_events(
-            icloud_calendar_id, time_min, time_max,
+            icloud_calendar_id, 
+            time_min=time_min if not icloud_sync_token else None,
+            time_max=time_max if not icloud_sync_token else None,
             max_results=self.settings.sync_config.max_events_per_sync,
-            updated_min=last_sync_time  # Only get events updated since last sync
+            sync_token=icloud_sync_token  # Use sync token for incremental sync (TODO: implement)
         ):
             icloud_events[event.id] = event
             if event.uid:
                 icloud_events_by_uid[event.uid] = event
+        
+        # Update sync tokens in database for next incremental sync
+        if new_google_sync_token or new_icloud_sync_token:
+            with self.db_manager.get_session() as session:
+                if new_google_sync_token:
+                    calendar_mapping.google_sync_token = new_google_sync_token
+                    calendar_mapping.google_last_updated = datetime.now(pytz.UTC)
+                if new_icloud_sync_token:
+                    calendar_mapping.icloud_sync_token = new_icloud_sync_token 
+                    calendar_mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                session.commit()
         
         self.logger.info(
             f"Found {len(google_events)} Google events, {len(icloud_events)} iCloud events"
@@ -410,7 +440,7 @@ class SyncEngine:
         # Handle deletions (events that exist in mapping but not in source)
         await self._handle_deletions(
             google_events, icloud_events, existing_mappings,
-            google_calendar_id, icloud_calendar_id,
+            google_calendar_id, icloud_calendar_id, calendar_mapping,
             sync_session, sync_report, dry_run
         )
     
@@ -513,29 +543,73 @@ class SyncEngine:
                         target_calendar_id, source_event
                     )
                     
-                    # Create mapping
+                    # Create mapping with all necessary fields for production
                     with self.db_manager.get_session() as session:
                         if source_event.source == EventSource.GOOGLE:
+                            # Extract resource info from created iCloud event
+                            icloud_resource_url = None
+                            if hasattr(created_event, 'original_data'):
+                                icloud_resource_url = created_event.original_data.get('resource_url')
+                            
                             mapping = EventMappingDB(
                                 calendar_mapping_id=calendar_mapping.id,
                                 google_event_id=source_event.id,
                                 icloud_event_id=created_event.id,
                                 google_calendar_id=calendar_mapping.google_calendar_id,
                                 icloud_calendar_id=calendar_mapping.icloud_calendar_id,
+                                
+                                # UIDs for cross-platform matching (CRITICAL)
+                                google_ical_uid=source_event.uid,
+                                icloud_uid=created_event.uid,
+                                event_uid=source_event.uid or created_event.uid,
+                                
+                                # Resource paths for direct access
+                                icloud_resource_url=icloud_resource_url,
+                                google_self_link=source_event.original_data.get('selfLink') if source_event.original_data else None,
+                                
+                                # ETags and sequences
+                                google_etag=source_event.etag,
+                                icloud_etag=created_event.etag,
+                                google_sequence=source_event.sequence or 0,
+                                icloud_sequence=created_event.sequence or 0,
+                                
                                 content_hash=content_hash,
                                 sync_direction=f"{source_event.source.value}_to_{target_source.value}",
-                                last_sync_at=datetime.now(pytz.UTC)
+                                last_sync_at=datetime.now(pytz.UTC),
+                                sync_status='active'
                             )
                         else:
+                            # Extract resource info from created Google event  
+                            google_self_link = None
+                            if hasattr(created_event, 'original_data'):
+                                google_self_link = created_event.original_data.get('selfLink')
+                                
                             mapping = EventMappingDB(
                                 calendar_mapping_id=calendar_mapping.id,
                                 google_event_id=created_event.id,
                                 icloud_event_id=source_event.id,
                                 google_calendar_id=calendar_mapping.google_calendar_id,
                                 icloud_calendar_id=calendar_mapping.icloud_calendar_id,
+                                
+                                # UIDs for cross-platform matching (CRITICAL)
+                                google_ical_uid=created_event.uid,
+                                icloud_uid=source_event.uid,
+                                event_uid=source_event.uid or created_event.uid,
+                                
+                                # Resource paths for direct access
+                                icloud_resource_url=source_event.original_data.get('resource_url') if source_event.original_data else None,
+                                google_self_link=google_self_link,
+                                
+                                # ETags and sequences
+                                google_etag=created_event.etag,
+                                icloud_etag=source_event.etag,
+                                google_sequence=created_event.sequence or 0,
+                                icloud_sequence=source_event.sequence or 0,
+                                
                                 content_hash=content_hash,
                                 sync_direction=f"{source_event.source.value}_to_{target_source.value}",
-                                last_sync_at=datetime.now(pytz.UTC)
+                                last_sync_at=datetime.now(pytz.UTC),
+                                sync_status='active'
                             )
                         
                         session.add(mapping)
@@ -666,11 +740,15 @@ class SyncEngine:
         mappings: List[EventMappingDB],
         google_calendar_id: str,
         icloud_calendar_id: str,
+        calendar_mapping: CalendarMappingDB,
         sync_session: SyncSessionDB,
         sync_report: SyncReport,
         dry_run: bool
     ) -> None:
-        """Handle deleted events.
+        """Handle deleted events with proper sync token validation.
+        
+        CRITICAL: Only process deletions when using sync tokens to avoid false positives
+        from time window limitations.
         
         Args:
             google_events: Current Google events
@@ -678,13 +756,38 @@ class SyncEngine:
             mappings: Existing event mappings
             google_calendar_id: Google calendar ID
             icloud_calendar_id: iCloud calendar ID
+            calendar_mapping: Calendar mapping with sync token info
             sync_session: Sync session
             sync_report: Sync report
             dry_run: Whether this is a dry run
         """
+        # CRITICAL: Only process deletions if we have sync tokens
+        # Time windows miss deletes and can cause false positives
+        has_google_sync_token = bool(calendar_mapping.google_sync_token)
+        has_icloud_sync_token = bool(calendar_mapping.icloud_sync_token)
+        
+        if not has_google_sync_token and not has_icloud_sync_token:
+            self.logger.warning(
+                "Skipping deletion detection - no sync tokens available. "
+                "Time window sync cannot reliably detect deletions."
+            )
+            return
+        
         for mapping in mappings:
-            google_deleted = mapping.google_event_id and mapping.google_event_id not in google_events
-            icloud_deleted = mapping.icloud_event_id and mapping.icloud_event_id not in icloud_events
+            # Only check active mappings
+            if hasattr(mapping, 'sync_status') and mapping.sync_status != 'active':
+                continue
+                
+            google_deleted = (
+                has_google_sync_token and 
+                mapping.google_event_id and 
+                mapping.google_event_id not in google_events
+            )
+            icloud_deleted = (
+                has_icloud_sync_token and 
+                mapping.icloud_event_id and 
+                mapping.icloud_event_id not in icloud_events
+            )
             
             if google_deleted and not icloud_deleted:
                 # Google event deleted, delete from iCloud
