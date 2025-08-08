@@ -11,12 +11,13 @@ import pytz
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .config import Settings
-from .database import DatabaseManager, EventMappingDB, SyncSessionDB
+from .database import DatabaseManager, EventMappingDB, SyncSessionDB, CalendarMappingDB
 from .models import (
     CalendarEvent, EventSource, ConflictResolution, SyncOperation, 
     SyncResult, SyncReport, SyncConfiguration
 )
 from .services import GoogleCalendarService, iCloudCalendarService, CalendarServiceError
+from .calendar_manager import CalendarManager
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,9 @@ class SyncEngine:
         self.google_service = GoogleCalendarService(settings)
         self.icloud_service = iCloudCalendarService(settings)
         self.conflict_resolver = ConflictResolver(settings.sync_config.conflict_resolution)
+        self.calendar_manager = CalendarManager(
+            settings, self.google_service, self.icloud_service, self.db_manager
+        )
         self.logger = logger.getChild('sync_engine')
         self._services_authenticated = False
     
@@ -181,28 +185,25 @@ class SyncEngine:
         try:
             self.logger.info(f"Starting sync session {sync_session.id} (dry_run={dry_run})")
             
-            # Get selected calendars
-            google_calendars = await self.google_service.get_calendars()
-            icloud_calendars = await self.icloud_service.get_calendars()
+            # Get or create calendar mappings
+            calendar_mappings = await self._get_or_create_calendar_mappings()
             
-            selected_google = [c for c in google_calendars if c.is_selected]
-            selected_icloud = [c for c in icloud_calendars if c.is_selected]
+            if not calendar_mappings:
+                self.logger.warning("No calendar mappings found or configured")
+                raise Exception("No calendar mappings available for synchronization")
             
-            if not selected_google:
-                selected_google = [await self.google_service.get_primary_calendar()]
-            if not selected_icloud:
-                selected_icloud = [await self.icloud_service.get_primary_calendar()]
+            self.logger.info(f"Syncing {len(calendar_mappings)} calendar pairs")
             
-            self.logger.info(
-                f"Syncing {len(selected_google)} Google calendars with {len(selected_icloud)} iCloud calendars"
-            )
-            
-            # Perform bidirectional sync for each calendar pair
-            for google_cal in selected_google:
-                for icloud_cal in selected_icloud:
-                    await self._sync_calendar_pair(
-                        google_cal.id, icloud_cal.id, sync_session, sync_report, dry_run
-                    )
+            # Perform bidirectional sync for each mapped calendar pair
+            for mapping in calendar_mappings:
+                await self._sync_calendar_pair(
+                    mapping.google_calendar_id,
+                    mapping.icloud_calendar_id, 
+                    mapping,
+                    sync_session, 
+                    sync_report, 
+                    dry_run
+                )
             
             # Complete sync session
             with self.db_manager.get_session() as session:
@@ -225,10 +226,64 @@ class SyncEngine:
         
         return sync_report
     
+    async def _get_or_create_calendar_mappings(self) -> List[CalendarMappingDB]:
+        """Get calendar mappings from database or create them from configuration.
+        
+        Returns:
+            List of calendar mappings ready for sync
+        """
+        # First try to get existing mappings from database
+        existing_mappings = await self.calendar_manager.get_all_mappings()
+        
+        if existing_mappings:
+            self.logger.info(f"Using {len(existing_mappings)} existing calendar mappings")
+            return existing_mappings
+        
+        # No existing mappings, discover calendars and create mappings
+        self.logger.info("No existing mappings found, discovering calendars...")
+        
+        google_calendars, icloud_calendars = await self.calendar_manager.discover_calendars()
+        
+        # Auto-match calendars
+        match_result = await self.calendar_manager.auto_match_calendars(
+            google_calendars, icloud_calendars
+        )
+        
+        if not match_result.matched_pairs:
+            # No matches found, create default mapping (primary to primary)
+            primary_google = next((c for c in google_calendars if c.is_primary), None)
+            primary_icloud = next((c for c in icloud_calendars if c.is_primary), None)
+            
+            if primary_google and primary_icloud:
+                match_result.matched_pairs = [(primary_google, primary_icloud)]
+                self.logger.info("Created default primary-to-primary mapping")
+            else:
+                raise Exception("No calendar matches found and unable to create default mapping")
+        
+        # Create database mappings
+        calendar_mappings = await self.calendar_manager.create_calendar_mappings(
+            match_result.matched_pairs
+        )
+        
+        self.logger.info(f"Created {len(calendar_mappings)} new calendar mappings")
+        
+        # Report unmatched calendars
+        if match_result.unmatched_google:
+            self.logger.info(
+                f"Unmatched Google calendars: {[c.name for c in match_result.unmatched_google]}"
+            )
+        if match_result.unmatched_icloud:
+            self.logger.info(
+                f"Unmatched iCloud calendars: {[c.name for c in match_result.unmatched_icloud]}"
+            )
+        
+        return calendar_mappings
+
     async def _sync_calendar_pair(
         self,
         google_calendar_id: str,
         icloud_calendar_id: str,
+        calendar_mapping: CalendarMappingDB,
         sync_session: SyncSessionDB,
         sync_report: SyncReport,
         dry_run: bool
@@ -238,11 +293,20 @@ class SyncEngine:
         Args:
             google_calendar_id: Google calendar ID
             icloud_calendar_id: iCloud calendar ID
+            calendar_mapping: Calendar mapping from database
             sync_session: Database sync session
             sync_report: Sync report to update
             dry_run: Whether this is a dry run
         """
-        self.logger.info(f"Syncing calendar pair: {google_calendar_id} <-> {icloud_calendar_id}")
+        self.logger.info(
+            f"Syncing calendar pair: {calendar_mapping.google_calendar_name or google_calendar_id} "
+            f"<-> {calendar_mapping.icloud_calendar_name or icloud_calendar_id}"
+        )
+        
+        # Skip if mapping is disabled
+        if not calendar_mapping.enabled:
+            self.logger.info("Calendar mapping is disabled, skipping")
+            return
         
         # Calculate time range for sync
         now = datetime.now(pytz.UTC)
@@ -269,11 +333,10 @@ class SyncEngine:
             f"Found {len(google_events)} Google events, {len(icloud_events)} iCloud events"
         )
         
-        # Get existing mappings
+        # Get existing event mappings for this calendar pair
         with self.db_manager.get_session() as session:
             existing_mappings = session.query(EventMappingDB).filter(
-                EventMappingDB.google_calendar_id == google_calendar_id,
-                EventMappingDB.icloud_calendar_id == icloud_calendar_id
+                EventMappingDB.calendar_mapping_id == calendar_mapping.id
             ).all()
         
         mappings_by_google = {m.google_event_id: m for m in existing_mappings if m.google_event_id}
@@ -283,27 +346,30 @@ class SyncEngine:
         processed_google = set()
         processed_icloud = set()
         
-        # Process Google -> iCloud sync
-        for google_event in google_events.values():
-            if google_event.id in processed_google:
-                continue
-            
-            await self._sync_event_to_target(
-                google_event, EventSource.ICLOUD, icloud_calendar_id,
-                mappings_by_google, sync_session, sync_report, dry_run
-            )
-            processed_google.add(google_event.id)
+        # Check sync direction and perform appropriate syncs
+        if calendar_mapping.bidirectional or calendar_mapping.sync_direction == 'google_to_icloud':
+            # Process Google -> iCloud sync
+            for google_event in google_events.values():
+                if google_event.id in processed_google:
+                    continue
+                
+                await self._sync_event_to_target(
+                    google_event, EventSource.ICLOUD, icloud_calendar_id,
+                    calendar_mapping, mappings_by_google, sync_session, sync_report, dry_run
+                )
+                processed_google.add(google_event.id)
         
-        # Process iCloud -> Google sync
-        for icloud_event in icloud_events.values():
-            if icloud_event.id in processed_icloud:
-                continue
-            
-            await self._sync_event_to_target(
-                icloud_event, EventSource.GOOGLE, google_calendar_id,
-                mappings_by_icloud, sync_session, sync_report, dry_run
-            )
-            processed_icloud.add(icloud_event.id)
+        if calendar_mapping.bidirectional or calendar_mapping.sync_direction == 'icloud_to_google':
+            # Process iCloud -> Google sync
+            for icloud_event in icloud_events.values():
+                if icloud_event.id in processed_icloud:
+                    continue
+                
+                await self._sync_event_to_target(
+                    icloud_event, EventSource.GOOGLE, google_calendar_id,
+                    calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run
+                )
+                processed_icloud.add(icloud_event.id)
         
         # Handle deletions (events that exist in mapping but not in source)
         await self._handle_deletions(
@@ -317,6 +383,7 @@ class SyncEngine:
         source_event: CalendarEvent,
         target_source: EventSource,
         target_calendar_id: str,
+        calendar_mapping: CalendarMappingDB,
         mappings: Dict[str, EventMappingDB],
         sync_session: SyncSessionDB,
         sync_report: SyncReport,
@@ -409,27 +476,31 @@ class SyncEngine:
                     
                     # Create mapping
                     with self.db_manager.get_session() as session:
-                        mapping_data = {
-                            'content_hash': content_hash,
-                            'sync_direction': f"{source_event.source.value}_to_{target_source.value}"
-                        }
-                        
                         if source_event.source == EventSource.GOOGLE:
-                            mapping_data.update({
-                                'google_event_id': source_event.id,
-                                'icloud_event_id': created_event.id,
-                                'google_calendar_id': source_event.original_data.get('calendar_id'),
-                                'icloud_calendar_id': target_calendar_id
-                            })
+                            mapping = EventMappingDB(
+                                calendar_mapping_id=calendar_mapping.id,
+                                google_event_id=source_event.id,
+                                icloud_event_id=created_event.id,
+                                google_calendar_id=calendar_mapping.google_calendar_id,
+                                icloud_calendar_id=calendar_mapping.icloud_calendar_id,
+                                content_hash=content_hash,
+                                sync_direction=f"{source_event.source.value}_to_{target_source.value}",
+                                last_sync_at=datetime.now(pytz.UTC)
+                            )
                         else:
-                            mapping_data.update({
-                                'google_event_id': created_event.id,
-                                'icloud_event_id': source_event.id,
-                                'google_calendar_id': target_calendar_id,
-                                'icloud_calendar_id': source_event.original_data.get('calendar_id')
-                            })
+                            mapping = EventMappingDB(
+                                calendar_mapping_id=calendar_mapping.id,
+                                google_event_id=created_event.id,
+                                icloud_event_id=source_event.id,
+                                google_calendar_id=calendar_mapping.google_calendar_id,
+                                icloud_calendar_id=calendar_mapping.icloud_calendar_id,
+                                content_hash=content_hash,
+                                sync_direction=f"{source_event.source.value}_to_{target_source.value}",
+                                last_sync_at=datetime.now(pytz.UTC)
+                            )
                         
-                        mapping = self.db_manager.create_event_mapping(session, **mapping_data)
+                        session.add(mapping)
+                        session.commit()
                 
                 await self._record_sync_operation(
                     sync_session, sync_report, SyncOperation.CREATE,

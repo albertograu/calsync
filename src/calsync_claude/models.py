@@ -164,6 +164,19 @@ class CalendarInfo(BaseModel):
     is_selected: bool = Field(True, description="Whether to sync this calendar")
 
 
+class CalendarMapping(BaseModel):
+    """Calendar mapping between Google and iCloud calendars."""
+    
+    google_calendar_id: str = Field(..., description="Google calendar ID")
+    icloud_calendar_id: str = Field(..., description="iCloud calendar ID")
+    google_calendar_name: Optional[str] = Field(None, description="Google calendar name")
+    icloud_calendar_name: Optional[str] = Field(None, description="iCloud calendar name")
+    bidirectional: bool = Field(True, description="Whether sync is bidirectional")
+    sync_direction: Optional[str] = Field(None, description="Sync direction if not bidirectional")
+    enabled: bool = Field(True, description="Whether this mapping is enabled")
+    conflict_resolution: Optional[ConflictResolution] = Field(None, description="Override global conflict resolution")
+
+
 class SyncConfiguration(BaseModel):
     """Sync configuration model."""
     
@@ -176,5 +189,14 @@ class SyncConfiguration(BaseModel):
     retry_delay_seconds: int = Field(5, ge=1)
     enable_webhooks: bool = Field(False)
     webhook_port: int = Field(8080, ge=1024, le=65535)
-    selected_google_calendars: List[str] = Field(default_factory=list)
-    selected_icloud_calendars: List[str] = Field(default_factory=list)
+    
+    # Calendar mappings - replaces the simple ID lists
+    calendar_mappings: List[CalendarMapping] = Field(default_factory=list, description="Calendar mappings")
+    
+    # Auto-mapping settings
+    auto_create_calendars: bool = Field(False, description="Auto-create missing calendars")
+    calendar_name_mapping: Dict[str, str] = Field(default_factory=dict, description="Calendar name mappings")
+    
+    # Legacy support (deprecated but maintained for backward compatibility)
+    selected_google_calendars: List[str] = Field(default_factory=list, description="Deprecated: use calendar_mappings")
+    selected_icloud_calendars: List[str] = Field(default_factory=list, description="Deprecated: use calendar_mappings")

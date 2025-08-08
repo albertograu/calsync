@@ -131,6 +131,29 @@ calsync-claude sync
 calsync-claude status
 ```
 
+### Multiple Calendar Management
+
+```bash
+# List all available calendars
+calsync-claude calendars list
+
+# Show current calendar mappings
+calsync-claude calendars mappings
+
+# Auto-map calendars based on name matching
+calsync-claude calendars auto-map
+
+# Create specific calendar mapping
+calsync-claude calendars create-mapping --google "primary" --icloud "Personal"
+calsync-claude calendars create-mapping --google "work@example.com" --icloud "Work" --bidirectional
+
+# Create unidirectional mapping
+calsync-claude calendars create-mapping --google "primary" --icloud "Shared" --unidirectional --direction google_to_icloud
+
+# Delete calendar mapping
+calsync-claude calendars delete-mapping <mapping-id>
+```
+
 ### Conflict Resolution
 
 ```bash

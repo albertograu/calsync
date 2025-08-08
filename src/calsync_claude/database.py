@@ -48,16 +48,38 @@ class GUID(TypeDecorator):
             return value
 
 
+class CalendarMappingDB(Base):
+    """Database model for calendar mappings between Google and iCloud."""
+    
+    __tablename__ = 'calendar_mappings'
+    
+    id = Column(GUID(), primary_key=True, default=uuid4)
+    google_calendar_id = Column(String(255), nullable=False, index=True)
+    icloud_calendar_id = Column(String(500), nullable=False, index=True)
+    google_calendar_name = Column(String(255), nullable=True)
+    icloud_calendar_name = Column(String(255), nullable=True)
+    bidirectional = Column(Boolean, nullable=False, default=True)
+    sync_direction = Column(String(20), nullable=True)  # 'google_to_icloud', 'icloud_to_google'
+    enabled = Column(Boolean, nullable=False, default=True)
+    conflict_resolution = Column(String(20), nullable=True)  # Override global setting
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
+    updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
+    
+    # Relationships
+    event_mappings = relationship("EventMappingDB", back_populates="calendar_mapping")
+
+
 class EventMappingDB(Base):
     """Database model for event mappings between services."""
     
     __tablename__ = 'event_mappings'
     
     id = Column(GUID(), primary_key=True, default=uuid4)
+    calendar_mapping_id = Column(GUID(), ForeignKey('calendar_mappings.id'), nullable=False, index=True)
     google_event_id = Column(String(255), nullable=True, index=True)
     icloud_event_id = Column(String(255), nullable=True, index=True)
-    google_calendar_id = Column(String(255), nullable=True)
-    icloud_calendar_id = Column(String(500), nullable=True)
+    google_calendar_id = Column(String(255), nullable=True, index=True)
+    icloud_calendar_id = Column(String(500), nullable=True, index=True)
     google_etag = Column(String(255), nullable=True)
     icloud_etag = Column(String(255), nullable=True)
     content_hash = Column(String(64), nullable=False, index=True)
@@ -67,6 +89,7 @@ class EventMappingDB(Base):
     sync_direction = Column(String(20), nullable=True)  # 'google_to_icloud', 'icloud_to_google'
     
     # Relationships
+    calendar_mapping = relationship("CalendarMappingDB", back_populates="event_mappings")
     sync_operations = relationship("SyncOperationDB", back_populates="event_mapping")
 
 
@@ -458,3 +481,147 @@ class DatabaseManager:
         return session.query(ConflictDB).filter(
             ConflictDB.resolved == False
         ).order_by(ConflictDB.created_at.desc()).all()
+    
+    def get_calendar_mappings(self, session: Session) -> List[CalendarMappingDB]:
+        """Get all calendar mappings.
+        
+        Args:
+            session: Database session
+            
+        Returns:
+            List of calendar mappings
+        """
+        return session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.enabled == True
+        ).order_by(CalendarMappingDB.created_at).all()
+    
+    def get_calendar_mapping(
+        self,
+        session: Session,
+        google_calendar_id: str,
+        icloud_calendar_id: str
+    ) -> Optional[CalendarMappingDB]:
+        """Get a specific calendar mapping.
+        
+        Args:
+            session: Database session
+            google_calendar_id: Google calendar ID
+            icloud_calendar_id: iCloud calendar ID
+            
+        Returns:
+            Calendar mapping or None
+        """
+        return session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_calendar_id == google_calendar_id,
+            CalendarMappingDB.icloud_calendar_id == icloud_calendar_id
+        ).first()
+    
+    def create_calendar_mapping(
+        self,
+        session: Session,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        google_calendar_name: Optional[str] = None,
+        icloud_calendar_name: Optional[str] = None,
+        bidirectional: bool = True,
+        sync_direction: Optional[str] = None,
+        enabled: bool = True,
+        conflict_resolution: Optional[str] = None
+    ) -> CalendarMappingDB:
+        """Create a new calendar mapping.
+        
+        Args:
+            session: Database session
+            google_calendar_id: Google calendar ID
+            icloud_calendar_id: iCloud calendar ID
+            google_calendar_name: Google calendar name
+            icloud_calendar_name: iCloud calendar name
+            bidirectional: Whether sync is bidirectional
+            sync_direction: Sync direction if not bidirectional
+            enabled: Whether mapping is enabled
+            conflict_resolution: Override conflict resolution
+            
+        Returns:
+            Created calendar mapping
+        """
+        mapping = CalendarMappingDB(
+            google_calendar_id=google_calendar_id,
+            icloud_calendar_id=icloud_calendar_id,
+            google_calendar_name=google_calendar_name,
+            icloud_calendar_name=icloud_calendar_name,
+            bidirectional=bidirectional,
+            sync_direction=sync_direction,
+            enabled=enabled,
+            conflict_resolution=conflict_resolution
+        )
+        
+        session.add(mapping)
+        session.commit()
+        return mapping
+    
+    def update_calendar_mapping(
+        self,
+        session: Session,
+        mapping: CalendarMappingDB,
+        **kwargs
+    ) -> CalendarMappingDB:
+        """Update calendar mapping.
+        
+        Args:
+            session: Database session
+            mapping: Calendar mapping to update
+            **kwargs: Fields to update
+            
+        Returns:
+            Updated calendar mapping
+        """
+        for key, value in kwargs.items():
+            if hasattr(mapping, key):
+                setattr(mapping, key, value)
+        
+        mapping.updated_at = datetime.now(pytz.UTC)
+        session.commit()
+        return mapping
+    
+    def delete_calendar_mapping(
+        self,
+        session: Session,
+        mapping: CalendarMappingDB
+    ) -> None:
+        """Delete calendar mapping.
+        
+        Args:
+            session: Database session
+            mapping: Calendar mapping to delete
+        """
+        session.delete(mapping)
+        session.commit()
+    
+    def get_event_mapping_by_calendar(
+        self, 
+        session: Session,
+        calendar_mapping_id: UUID,
+        google_event_id: Optional[str] = None,
+        icloud_event_id: Optional[str] = None
+    ) -> Optional[EventMappingDB]:
+        """Get event mapping by calendar mapping and event IDs.
+        
+        Args:
+            session: Database session
+            calendar_mapping_id: Calendar mapping ID
+            google_event_id: Google event ID
+            icloud_event_id: iCloud event ID
+            
+        Returns:
+            Event mapping or None if not found
+        """
+        query = session.query(EventMappingDB).filter(
+            EventMappingDB.calendar_mapping_id == calendar_mapping_id
+        )
+        
+        if google_event_id:
+            query = query.filter(EventMappingDB.google_event_id == google_event_id)
+        if icloud_event_id:
+            query = query.filter(EventMappingDB.icloud_event_id == icloud_event_id)
+        
+        return query.first()

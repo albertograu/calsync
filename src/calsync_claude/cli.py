@@ -400,6 +400,263 @@ def reset(ctx):
         sys.exit(1)
 
 
+@cli.group()
+def calendars():
+    """Calendar management commands."""
+    pass
+
+
+@calendars.command('list')
+@click.pass_context
+async def list_calendars(ctx):
+    """List all available calendars from both services."""
+    settings = ctx.obj['settings']
+    
+    try:
+        async with SyncEngine(settings) as sync_engine:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True
+            ) as progress:
+                task = progress.add_task("Discovering calendars...", total=None)
+                
+                google_calendars, icloud_calendars = await sync_engine.calendar_manager.discover_calendars()
+        
+        # Display Google calendars
+        console.print("\n[bold]Google Calendars[/bold]")
+        google_table = Table(show_header=True, header_style="bold blue")
+        google_table.add_column("Name", style="cyan")
+        google_table.add_column("ID", style="dim")
+        google_table.add_column("Primary", justify="center")
+        google_table.add_column("Access", justify="center")
+        
+        for cal in google_calendars:
+            google_table.add_row(
+                cal.name,
+                cal.id,
+                "✓" if cal.is_primary else "",
+                cal.access_role or ""
+            )
+        console.print(google_table)
+        
+        # Display iCloud calendars  
+        console.print("\n[bold]iCloud Calendars[/bold]")
+        icloud_table = Table(show_header=True, header_style="bold green")
+        icloud_table.add_column("Name", style="cyan")
+        icloud_table.add_column("ID", style="dim")
+        icloud_table.add_column("Primary", justify="center")
+        
+        for cal in icloud_calendars:
+            icloud_table.add_row(
+                cal.name,
+                cal.id[:50] + "..." if len(cal.id) > 50 else cal.id,
+                "✓" if cal.is_primary else ""
+            )
+        console.print(icloud_table)
+        
+        console.print(f"\nTotal: [blue]{len(google_calendars)} Google[/blue], [green]{len(icloud_calendars)} iCloud[/green] calendars")
+        
+    except Exception as e:
+        console.print(f"[red]Failed to list calendars: {e}[/red]")
+        sys.exit(1)
+
+
+@calendars.command('mappings')
+@click.pass_context
+async def show_mappings(ctx):
+    """Show current calendar mappings."""
+    settings = ctx.obj['settings']
+    
+    try:
+        async with SyncEngine(settings) as sync_engine:
+            mappings = await sync_engine.calendar_manager.get_all_mappings()
+        
+        if not mappings:
+            console.print("[yellow]No calendar mappings configured[/yellow]")
+            console.print("Use [bold]calsync-claude calendars create-mapping[/bold] to create mappings")
+            return
+        
+        # Display mappings table
+        table = Table(show_header=True, header_style="bold magenta", title="Calendar Mappings")
+        table.add_column("ID", style="dim")
+        table.add_column("Google Calendar", style="blue")
+        table.add_column("iCloud Calendar", style="green")
+        table.add_column("Direction", justify="center")
+        table.add_column("Enabled", justify="center")
+        table.add_column("Created")
+        
+        for mapping in mappings:
+            direction = "↔️" if mapping.bidirectional else ("→" if mapping.sync_direction == "google_to_icloud" else "←")
+            enabled = "✅" if mapping.enabled else "❌"
+            
+            table.add_row(
+                str(mapping.id)[:8],
+                mapping.google_calendar_name or mapping.google_calendar_id,
+                mapping.icloud_calendar_name or mapping.icloud_calendar_id,
+                direction,
+                enabled,
+                mapping.created_at.strftime("%Y-%m-%d")
+            )
+        
+        console.print(table)
+        
+    except Exception as e:
+        console.print(f"[red]Failed to show mappings: {e}[/red]")
+        sys.exit(1)
+
+
+@calendars.command('create-mapping')
+@click.option('--google', '-g', required=True, help='Google calendar ID or name')
+@click.option('--icloud', '-i', required=True, help='iCloud calendar name')
+@click.option('--bidirectional/--unidirectional', default=True, help='Sync direction')
+@click.option('--direction', type=click.Choice(['google_to_icloud', 'icloud_to_google']), 
+              help='Sync direction for unidirectional sync')
+@click.pass_context
+async def create_mapping(ctx, google, icloud, bidirectional, direction):
+    """Create a new calendar mapping."""
+    settings = ctx.obj['settings']
+    
+    if not bidirectional and not direction:
+        console.print("[red]Must specify --direction for unidirectional sync[/red]")
+        sys.exit(1)
+    
+    try:
+        async with SyncEngine(settings) as sync_engine:
+            # Discover calendars
+            google_calendars, icloud_calendars = await sync_engine.calendar_manager.discover_calendars()
+            
+            # Find matching calendars
+            google_cal = sync_engine.calendar_manager._find_google_calendar(google_calendars, google)
+            icloud_cal = sync_engine.calendar_manager._find_icloud_calendar(icloud_calendars, icloud)
+            
+            if not google_cal:
+                console.print(f"[red]Google calendar '{google}' not found[/red]")
+                sys.exit(1)
+            
+            if not icloud_cal:
+                console.print(f"[red]iCloud calendar '{icloud}' not found[/red]")
+                sys.exit(1)
+            
+            # Create mapping
+            mapping = await sync_engine.calendar_manager.create_calendar_mappings(
+                [(google_cal, icloud_cal)],
+                bidirectional=bidirectional
+            )
+            
+            if mapping:
+                mapping = mapping[0]
+                if not bidirectional and direction:
+                    await sync_engine.calendar_manager.update_mapping(
+                        str(mapping.id), sync_direction=direction
+                    )
+                
+                console.print(f"[green]✓ Created mapping:[/green] {google_cal.name} ↔️ {icloud_cal.name}")
+            else:
+                console.print("[yellow]Mapping already exists[/yellow]")
+        
+    except Exception as e:
+        console.print(f"[red]Failed to create mapping: {e}[/red]")
+        sys.exit(1)
+
+
+@calendars.command('delete-mapping')
+@click.argument('mapping_id')
+@click.confirmation_option(prompt='Are you sure you want to delete this mapping?')
+@click.pass_context
+async def delete_mapping(ctx, mapping_id):
+    """Delete a calendar mapping."""
+    settings = ctx.obj['settings']
+    
+    try:
+        async with SyncEngine(settings) as sync_engine:
+            success = await sync_engine.calendar_manager.delete_mapping(mapping_id)
+            
+            if success:
+                console.print(f"[green]✓ Deleted mapping {mapping_id}[/green]")
+            else:
+                console.print(f"[red]Mapping {mapping_id} not found[/red]")
+                sys.exit(1)
+        
+    except Exception as e:
+        console.print(f"[red]Failed to delete mapping: {e}[/red]")
+        sys.exit(1)
+
+
+@calendars.command('auto-map')
+@click.option('--dry-run', '-n', is_flag=True, help='Show what would be mapped without creating')
+@click.pass_context
+async def auto_map_calendars(ctx, dry_run):
+    """Automatically create calendar mappings based on name matching."""
+    settings = ctx.obj['settings']
+    
+    try:
+        async with SyncEngine(settings) as sync_engine:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True
+            ) as progress:
+                task = progress.add_task("Discovering calendars...", total=None)
+                
+                google_calendars, icloud_calendars = await sync_engine.calendar_manager.discover_calendars()
+                
+                progress.update(task, description="Matching calendars...")
+                
+                match_result = await sync_engine.calendar_manager.auto_match_calendars(
+                    google_calendars, icloud_calendars
+                )
+        
+        if match_result.matched_pairs:
+            console.print(f"\n[green]Found {len(match_result.matched_pairs)} calendar matches:[/green]")
+            
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("Google Calendar", style="blue")
+            table.add_column("iCloud Calendar", style="green")
+            table.add_column("Match Type")
+            
+            for google_cal, icloud_cal in match_result.matched_pairs:
+                # Determine match type
+                if google_cal.name.lower() == icloud_cal.name.lower():
+                    match_type = "Exact name match"
+                elif google_cal.is_primary and icloud_cal.is_primary:
+                    match_type = "Primary calendars"
+                else:
+                    match_type = "Similarity match"
+                
+                table.add_row(google_cal.name, icloud_cal.name, match_type)
+            
+            console.print(table)
+            
+            if not dry_run:
+                if Confirm.ask("\nCreate these mappings?"):
+                    mappings = await sync_engine.calendar_manager.create_calendar_mappings(
+                        match_result.matched_pairs
+                    )
+                    console.print(f"[green]✓ Created {len(mappings)} calendar mappings[/green]")
+                else:
+                    console.print("[yellow]Cancelled mapping creation[/yellow]")
+        else:
+            console.print("[yellow]No calendar matches found[/yellow]")
+        
+        # Show unmatched calendars
+        if match_result.unmatched_google:
+            console.print(f"\n[yellow]Unmatched Google calendars ({len(match_result.unmatched_google)}):[/yellow]")
+            for cal in match_result.unmatched_google:
+                console.print(f"  • {cal.name}")
+        
+        if match_result.unmatched_icloud:
+            console.print(f"\n[yellow]Unmatched iCloud calendars ({len(match_result.unmatched_icloud)}):[/yellow]")
+            for cal in match_result.unmatched_icloud:
+                console.print(f"  • {cal.name}")
+        
+    except Exception as e:
+        console.print(f"[red]Failed to auto-map calendars: {e}[/red]")
+        sys.exit(1)
+
+
 @cli.command()
 @click.pass_context
 async def conflicts(ctx):
