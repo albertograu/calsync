@@ -48,7 +48,7 @@ class AsyncGroup(click.Group):
     def invoke(self, ctx):
         """Invoke the command, handling async commands."""
         if asyncio.iscoroutinefunction(ctx.command.callback):
-            return asyncio.run(ctx.command.callback(**ctx.params))
+            return asyncio.run(ctx.command.callback(ctx, **ctx.params))
         return super().invoke(ctx)
 
 

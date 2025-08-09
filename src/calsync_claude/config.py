@@ -142,10 +142,10 @@ class Settings(BaseSettings):
         """Validate Google OAuth Client ID format."""
         if not v:
             return v
-        # Google Client IDs follow pattern: numbers.apps.googleusercontent.com
-        import re
-        if not re.match(r'^\d+.*\.apps\.googleusercontent\.com$', v):
-            raise ValueError("Invalid Google Client ID format")
+        # Allow any non-empty string that looks like a reasonable client ID
+        v = v.strip()
+        if not v or len(v) < 10:
+            raise ValueError("Google Client ID must be at least 10 characters")
         return v
     
     @validator('google_client_secret')
@@ -153,9 +153,10 @@ class Settings(BaseSettings):
         """Validate Google Client Secret format."""
         if not v:
             return v
-        # Google Client Secrets are typically 24 characters, alphanumeric with dashes/underscores
-        if len(v) < 20 or not v.replace('-', '').replace('_', '').isalnum():
-            raise ValueError("Invalid Google Client Secret format")
+        # Allow any non-empty string that looks like a reasonable client secret
+        v = v.strip()
+        if not v or len(v) < 10:
+            raise ValueError("Google Client Secret must be at least 10 characters")
         return v
     
     @validator('icloud_username')
