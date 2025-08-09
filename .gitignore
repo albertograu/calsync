@@ -138,6 +138,9 @@ credentials/
 google_token.json
 google_credentials.json
 .calsync-claude/
+secrets/
+*.secret
+*.key
 
 # IDE files
 .vscode/

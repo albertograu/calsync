@@ -1,6 +1,7 @@
 """Enhanced command-line interface with Rich formatting and advanced features."""
 
 import asyncio
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -697,8 +698,10 @@ async def conflicts(ctx):
         
         console.print(table)
         
-        # TODO: Add interactive conflict resolution
-        console.print("\n[dim]Interactive conflict resolution coming soon...[/dim]")
+        # Show conflict summary with resolution guidance
+        console.print(f"\n[yellow]⚠️  {len(conflicts)} conflicts detected[/yellow]")
+        console.print("[dim]Conflicts will be automatically resolved using the configured strategy during sync.[/dim]")
+        console.print("[dim]Check sync logs for resolution details.[/dim]")
         
     except Exception as e:
         console.print(f"[red]Failed to get conflicts: {e}[/red]")
@@ -1004,6 +1007,7 @@ def pairs(list_pairs, validate, migrate, example):
             title="Configuration Error",
             border_style="red"
         ))
+
 
 
 def main():

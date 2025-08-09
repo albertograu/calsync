@@ -61,10 +61,12 @@ class GoogleCalendarService(BaseCalendarService):
                     )
                     creds = flow.run_local_server(port=0)
                 
-                # Save credentials for next run
-                token_path.parent.mkdir(parents=True, exist_ok=True)
+                # Save credentials for next run with secure permissions
+                token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 with open(token_path, 'w') as token:
                     token.write(creds.to_json())
+                # Set secure file permissions (owner read/write only)
+                token_path.chmod(0o600)
             
             # Build the service
             self.service = build('calendar', 'v3', credentials=creds)
@@ -97,10 +99,12 @@ class GoogleCalendarService(BaseCalendarService):
         }
         
         credentials_path = self.settings.google_credentials_path
-        credentials_path.parent.mkdir(parents=True, exist_ok=True)
+        credentials_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         
         with open(credentials_path, 'w') as f:
             json.dump(credentials_data, f)
+        # Set secure file permissions (owner read/write only)
+        credentials_path.chmod(0o600)
     
     async def get_calendars(self) -> List[CalendarInfo]:
         """Get list of Google calendars."""

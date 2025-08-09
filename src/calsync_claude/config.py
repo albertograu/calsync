@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # Google Calendar API Configuration
     google_client_id: str = Field(..., description="Google OAuth Client ID")
     google_client_secret: str = Field(..., description="Google OAuth Client Secret")
+    google_client_id_file: Optional[str] = Field(None, description="Path to file containing Google Client ID")
+    google_client_secret_file: Optional[str] = Field(None, description="Path to file containing Google Client Secret")
     google_scopes: List[str] = Field(
         default=["https://www.googleapis.com/auth/calendar"],
         description="Google API scopes"
@@ -31,6 +33,8 @@ class Settings(BaseSettings):
     # iCloud Calendar Configuration (CalDAV)
     icloud_username: str = Field(..., description="iCloud username/email")
     icloud_password: str = Field(..., description="iCloud app-specific password")
+    icloud_username_file: Optional[str] = Field(None, description="Path to file containing iCloud username")
+    icloud_password_file: Optional[str] = Field(None, description="Path to file containing iCloud password")
     icloud_server_url: str = Field(
         default="https://caldav.icloud.com",
         description="iCloud CalDAV server URL"
@@ -130,11 +134,93 @@ class Settings(BaseSettings):
             raise ValueError(f"Log level must be one of: {valid_levels}")
         return v.upper()
     
+    @validator('google_client_id')
+    def validate_google_client_id(cls, v):
+        """Validate Google OAuth Client ID format."""
+        if not v:
+            return v
+        # Google Client IDs follow pattern: numbers.apps.googleusercontent.com
+        import re
+        if not re.match(r'^\d+.*\.apps\.googleusercontent\.com$', v):
+            raise ValueError("Invalid Google Client ID format")
+        return v
+    
+    @validator('google_client_secret')
+    def validate_google_client_secret(cls, v):
+        """Validate Google Client Secret format."""
+        if not v:
+            return v
+        # Google Client Secrets are typically 24 characters, alphanumeric with dashes/underscores
+        if len(v) < 20 or not v.replace('-', '').replace('_', '').isalnum():
+            raise ValueError("Invalid Google Client Secret format")
+        return v
+    
+    @validator('icloud_username')
+    def validate_icloud_username(cls, v):
+        """Validate iCloud username is a valid email."""
+        if not v:
+            return v
+        import re
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_pattern, v):
+            raise ValueError("iCloud username must be a valid email address")
+        return v
+    
+    @validator('icloud_password')
+    def validate_icloud_password(cls, v):
+        """Validate iCloud app-specific password format."""
+        if not v:
+            return v
+        # App-specific passwords are 16 characters, groups of 4 separated by dashes
+        import re
+        if not re.match(r'^[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}$', v.lower()):
+            raise ValueError("iCloud password should be an app-specific password (format: xxxx-xxxx-xxxx-xxxx)")
+        return v
+    
+    def __init__(self, **kwargs):
+        """Initialize settings with file-based credential support."""
+        # Load credentials from files if file paths are provided
+        if 'google_client_id_file' in kwargs and kwargs['google_client_id_file']:
+            kwargs['google_client_id'] = self._read_credential_file(kwargs['google_client_id_file'])
+        if 'google_client_secret_file' in kwargs and kwargs['google_client_secret_file']:
+            kwargs['google_client_secret'] = self._read_credential_file(kwargs['google_client_secret_file'])
+        if 'icloud_username_file' in kwargs and kwargs['icloud_username_file']:
+            kwargs['icloud_username'] = self._read_credential_file(kwargs['icloud_username_file'])
+        if 'icloud_password_file' in kwargs and kwargs['icloud_password_file']:
+            kwargs['icloud_password'] = self._read_credential_file(kwargs['icloud_password_file'])
+        
+        super().__init__(**kwargs)
+    
+    def _read_credential_file(self, file_path: str) -> str:
+        """Read credential from file with proper error handling.
+        
+        Args:
+            file_path: Path to credential file
+            
+        Returns:
+            Credential value
+            
+        Raises:
+            ValueError: If file cannot be read
+        """
+        try:
+            with open(file_path, 'r') as f:
+                credential = f.read().strip()
+            if not credential:
+                raise ValueError(f"Credential file {file_path} is empty")
+            return credential
+        except FileNotFoundError:
+            raise ValueError(f"Credential file not found: {file_path}")
+        except PermissionError:
+            raise ValueError(f"Permission denied reading credential file: {file_path}")
+        except Exception as e:
+            raise ValueError(f"Error reading credential file {file_path}: {e}")
+    
     def ensure_directories(self):
-        """Create necessary directories."""
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        """Create necessary directories with proper permissions."""
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)  # Owner only
         if self.credentials_dir:
-            self.credentials_dir.mkdir(parents=True, exist_ok=True)
+            self.credentials_dir.mkdir(parents=True, exist_ok=True, mode=0o700)  # Owner only
     
     @property
     def google_credentials_path(self) -> Path:

@@ -40,7 +40,7 @@ class ConflictResolver:
         icloud_event: CalendarEvent,
         mapping: EventMappingDB
     ) -> Tuple[Optional[CalendarEvent], str]:
-        """Resolve conflict between two events.
+        """Resolve conflict between two events using automated strategies for headless operation.
         
         Args:
             google_event: Google Calendar event
@@ -50,8 +50,12 @@ class ConflictResolver:
         Returns:
             Tuple of (winning_event, resolution_reason)
         """
-        if self.strategy == ConflictResolution.MANUAL:
-            return None, "Manual resolution required"
+        # For headless operation, never return None - always resolve automatically
+        # Manual resolution is converted to LATEST_WINS
+        strategy = self.strategy
+        if strategy == ConflictResolution.MANUAL:
+            strategy = ConflictResolution.LATEST_WINS
+            self.logger.info("Converting MANUAL resolution to LATEST_WINS for headless operation")
         
         # First try sequence-based resolution (preferred for iCal events)
         google_seq = google_event.sequence or 0
@@ -59,25 +63,32 @@ class ConflictResolver:
         
         if google_seq != icloud_seq:
             if google_seq > icloud_seq:
-                return google_event, f"Google event has higher sequence ({google_seq} > {icloud_seq})"
+                return google_event, f"Auto-resolved: Google event has higher sequence ({google_seq} > {icloud_seq})"
             else:
-                return icloud_event, f"iCloud event has higher sequence ({icloud_seq} > {google_seq})"
+                return icloud_event, f"Auto-resolved: iCloud event has higher sequence ({icloud_seq} > {google_seq})"
         
-        # Fallback to timestamp-based resolution
-        elif self.strategy == ConflictResolution.LATEST_WINS:
+        # Sequence-based resolution failed, use configured strategy
+        if strategy == ConflictResolution.LATEST_WINS:
             if google_event.updated > icloud_event.updated:
-                return google_event, "Google event is more recent"
+                return google_event, f"Auto-resolved: Google event is more recent ({google_event.updated} > {icloud_event.updated})"
+            elif icloud_event.updated > google_event.updated:
+                return icloud_event, f"Auto-resolved: iCloud event is more recent ({icloud_event.updated} > {google_event.updated})"
             else:
-                return icloud_event, "iCloud event is more recent"
+                # Same timestamp, prefer Google as tiebreaker for consistency
+                return google_event, "Auto-resolved: Equal timestamps, Google wins (tiebreaker)"
         
-        elif self.strategy == ConflictResolution.GOOGLE_WINS:
-            return google_event, "Google wins policy"
+        elif strategy == ConflictResolution.GOOGLE_WINS:
+            return google_event, "Auto-resolved: Google wins policy"
         
-        elif self.strategy == ConflictResolution.ICLOUD_WINS:
-            return icloud_event, "iCloud wins policy"
+        elif strategy == ConflictResolution.ICLOUD_WINS:
+            return icloud_event, "Auto-resolved: iCloud wins policy"
         
         else:
-            return None, f"Unknown resolution strategy: {self.strategy}"
+            # Fallback for unknown strategies - prefer latest
+            if google_event.updated > icloud_event.updated:
+                return google_event, f"Auto-resolved: Unknown strategy '{strategy}', defaulted to latest (Google)"
+            else:
+                return icloud_event, f"Auto-resolved: Unknown strategy '{strategy}', defaulted to latest (iCloud)"
 
 
 class SyncEngine:
@@ -349,33 +360,11 @@ class SyncEngine:
         new_google_sync_token: Optional[str] = None
         new_icloud_sync_token: Optional[str] = None
 
-        # Fetch Google change set, handle 410 token invalidation
-        try:
-            g_cs: ChangeSet[CalendarEvent] = await self.google_service.get_change_set(
-                google_calendar_id,
-                time_min=None if google_sync_token else time_min,
-                time_max=None if google_sync_token else time_max,
-                max_results=self.settings.sync_config.max_events_per_sync,
-                updated_min=None if google_sync_token else last_sync_time,
-                sync_token=google_sync_token
-            )
-        except GoogleCalendarService.TokenInvalid:
-                # Clear token and perform one-time backfill to mint a new token; do NOT process deletions from Google this run
-                self.logger.warning("Resetting Google sync token and performing backfill to mint a new token")
-                with self.db_manager.get_session() as session:
-                    calendar_mapping.google_sync_token = None
-                    calendar_mapping.google_last_updated = None
-                    session.commit()
-                g_cs = await self.google_service.get_change_set(
-                    google_calendar_id,
-                    time_min=time_min,
-                    time_max=time_max,
-                    max_results=self.settings.sync_config.max_events_per_sync,
-                    updated_min=None,
-                    sync_token=None
-                )
-                # Ignore deletions during backfill
-                g_cs.deleted_native_ids = set()
+        # Fetch Google change set with proper error handling
+        g_cs = await self._fetch_google_change_set_with_retry(
+            google_calendar_id, google_sync_token, time_min, time_max, 
+            last_sync_time, calendar_mapping
+        )
 
         google_events = dict(g_cs.changed)
         google_deleted_ids = set(g_cs.deleted_native_ids)
@@ -492,34 +481,12 @@ class SyncEngine:
                             )
                         processed_icloud.add(override_event.id)
         
-        # Translate iCloud deleted hrefs to event IDs using mappings
+        # Translate iCloud deleted hrefs to event IDs using improved mapping logic
         icloud_deleted_ids: set[str] = set()
         if icloud_deleted_raw:
-            href_to_id: Dict[str, str] = {}
-            for m in existing_mappings:
-                if m.icloud_resource_url and m.icloud_event_id:
-                    href_to_id[m.icloud_resource_url] = m.icloud_event_id
-            matched = 0
-            unmatched = []
-            for href in icloud_deleted_raw:
-                mapped = False
-                if href in href_to_id:
-                    icloud_deleted_ids.add(href_to_id[href])
-                    matched += 1
-                    continue
-                # Fallback: match by suffix if server returned relative href
-                for res_url, ev_id in href_to_id.items():
-                    if res_url.endswith(href) or href.endswith(res_url):
-                        icloud_deleted_ids.add(ev_id)
-                        matched += 1
-                        mapped = True
-                        break
-                if not mapped:
-                    unmatched.append(href)
-            if unmatched:
-                self.logger.info(
-                    f"Unmapped iCloud deleted hrefs: {len(unmatched)}"
-                )
+            icloud_deleted_ids = await self._map_icloud_hrefs_to_event_ids(
+                icloud_deleted_raw, existing_mappings, icloud_calendar_id
+            )
 
         # Handle deletions using explicit deleted_id sets, only if used_sync_token on that side
         await self._handle_deletions(
@@ -754,7 +721,7 @@ class SyncEngine:
         sync_report: SyncReport,
         dry_run: bool
     ) -> None:
-        """Handle conflict between events.
+        """Handle conflict between events with automated resolution for headless operation.
         
         Args:
             source_event: Source event
@@ -765,9 +732,12 @@ class SyncEngine:
             sync_report: Sync report
             dry_run: Whether this is a dry run
         """
-        self.logger.warning(f"Conflict detected for events {source_event.id} <-> {target_event.id}")
+        self.logger.warning(
+            f"Conflict detected for events {source_event.id} <-> {target_event.id} "
+            f"(source: {source_event.source.value}, target: {target_event.source.value})"
+        )
         
-        # Try to resolve conflict
+        # Enhanced conflict resolution for headless operation
         winning_event, reason = self.conflict_resolver.resolve_conflict(
             source_event if source_event.source == EventSource.GOOGLE else target_event,
             target_event if target_event.source == EventSource.ICLOUD else source_event,
@@ -775,49 +745,78 @@ class SyncEngine:
         )
         
         if winning_event:
-            # Apply resolution
+            # Apply automated resolution
             target_service = (
                 self.icloud_service if target_event.source == EventSource.ICLOUD
                 else self.google_service
             )
             
             if not dry_run:
-                await target_service.update_event(
-                    target_calendar_id, target_event.id, winning_event
-                )
-                
-                # Update mapping
-                with self.db_manager.get_session() as session:
-                    self.db_manager.update_event_mapping(
-                        session, mapping,
-                        content_hash=winning_event.content_hash(),
-                        sync_direction=f"{winning_event.source.value}_wins"
+                try:
+                    await target_service.update_event(
+                        target_calendar_id, target_event.id, winning_event
                     )
+                    
+                    # Update mapping with resolution info
+                    with self.db_manager.get_session() as session:
+                        self.db_manager.update_event_mapping(
+                            session, mapping,
+                            content_hash=winning_event.content_hash(),
+                            sync_direction=f"{winning_event.source.value}_wins_conflict_resolution"
+                        )
+                    
+                    self.logger.info(f"✅ Conflict auto-resolved: {reason}")
+                    
+                    await self._record_sync_operation(
+                        sync_session, sync_report, SyncOperation.UPDATE,
+                        source_event.source, target_event.source, source_event.id,
+                        source_event.summary, True, mapping=mapping
+                    )
+                    
+                except Exception as e:
+                    self.logger.error(f"Failed to apply conflict resolution: {e}")
+                    # Fall through to conflict logging
+                    winning_event = None
+        
+        if not winning_event:
+            # Log conflict for monitoring but don't create database entries for headless operation
+            conflict_details = {
+                'google_event_id': source_event.id if source_event.source == EventSource.GOOGLE else target_event.id,
+                'icloud_event_id': target_event.id if target_event.source == EventSource.ICLOUD else source_event.id,
+                'google_summary': source_event.summary if source_event.source == EventSource.GOOGLE else target_event.summary,
+                'icloud_summary': target_event.summary if target_event.source == EventSource.ICLOUD else source_event.summary,
+                'google_updated': str(source_event.updated if source_event.source == EventSource.GOOGLE else target_event.updated),
+                'icloud_updated': str(target_event.updated if target_event.source == EventSource.ICLOUD else source_event.updated),
+                'conflict_reason': reason or 'Unable to auto-resolve'
+            }
             
-            self.logger.info(f"Conflict resolved: {reason}")
-            
-            await self._record_sync_operation(
-                sync_session, sync_report, SyncOperation.UPDATE,
-                source_event.source, target_event.source, source_event.id,
-                source_event.summary, True, mapping=mapping
+            # Log structured conflict data for monitoring systems
+            self.logger.error(
+                f"❌ Unresolved conflict requiring attention",
+                extra={
+                    'conflict_type': 'content_mismatch',
+                    'conflict_details': conflict_details,
+                    'sync_session_id': str(sync_session.id) if sync_session else None
+                }
             )
-        else:
-            # Manual resolution required
-            with self.db_manager.get_session() as session:
-                self.db_manager.create_conflict(
-                    session, sync_session, "content_mismatch",
-                    google_event_id=source_event.id if source_event.source == EventSource.GOOGLE else target_event.id,
-                    icloud_event_id=target_event.id if target_event.source == EventSource.ICLOUD else source_event.id,
-                    google_event_data=json.dumps(source_event.dict() if source_event.source == EventSource.GOOGLE else target_event.dict()),
-                    icloud_event_data=json.dumps(target_event.dict() if target_event.source == EventSource.ICLOUD else source_event.dict())
-                )
             
+            # For headless operation, we'll skip the conflicted event rather than create database conflicts
+            # This prevents the sync from getting stuck on unresolvable conflicts
             sync_report.conflicts.append({
                 'source_event_id': source_event.id,
                 'target_event_id': target_event.id,
-                'reason': reason,
-                'resolution': 'manual_required'
+                'reason': reason or 'Unable to auto-resolve',
+                'resolution': 'skipped_for_headless_operation',
+                'details': conflict_details
             })
+            
+            await self._record_sync_operation(
+                sync_session, sync_report, SyncOperation.SKIP,
+                source_event.source, target_event.source, source_event.id,
+                source_event.summary, False, 
+                error=f"Conflict skipped: {reason or 'Unable to auto-resolve'}", 
+                mapping=mapping
+            )
     
     async def _handle_deletions(
         self,
@@ -1029,20 +1028,7 @@ class SyncEngine:
         
         # First pass: identify master events and overrides
         for event in events.values():
-            is_recurrence_override = False
-            
-            # Check if this is a recurrence override event
-            if event.recurrence_overrides:
-                for override in event.recurrence_overrides:
-                    if override.get('type') == 'recurrence-id' and override.get('is_override'):
-                        is_recurrence_override = True
-                        break
-            
-            # Google Calendar specific: recurringEventId indicates override
-            if hasattr(event, 'recurring_event_id') and event.recurring_event_id:
-                is_recurrence_override = True
-                
-            if is_recurrence_override:
+            if self._is_recurrence_override(event):
                 override_events.append(event)
             else:
                 # This is a master event or standalone event
@@ -1055,16 +1041,7 @@ class SyncEngine:
         
         # Second pass: link overrides to their masters
         for override_event in override_events:
-            master_id = None
-            
-            # Try to find master by Google's recurringEventId
-            if hasattr(override_event, 'recurring_event_id') and override_event.recurring_event_id:
-                if override_event.recurring_event_id in grouped:
-                    master_id = override_event.recurring_event_id
-            
-            # Try to find master by UID (iCloud/iCal standard)
-            if not master_id and override_event.uid and override_event.uid in master_events:
-                master_id = master_events[override_event.uid]
+            master_id = self._find_master_event_id(override_event, grouped, master_events)
             
             if master_id and master_id in grouped:
                 grouped[master_id]['overrides'].append(override_event)
@@ -1077,3 +1054,330 @@ class SyncEngine:
                 }
         
         return grouped
+    
+    def _is_recurrence_override(self, event: CalendarEvent) -> bool:
+        """Check if an event is a recurrence override.
+        
+        Args:
+            event: Calendar event to check
+            
+        Returns:
+            True if event is a recurrence override
+        """
+        # Check recurrence_overrides field
+        if event.recurrence_overrides:
+            for override in event.recurrence_overrides:
+                if override.get('type') == 'recurrence-id' and override.get('is_override'):
+                    return True
+        
+        # Google Calendar specific: recurringEventId indicates override
+        if hasattr(event, 'recurring_event_id') and event.recurring_event_id:
+            return True
+            
+        return False
+    
+    def _find_master_event_id(
+        self, 
+        override_event: CalendarEvent, 
+        grouped: Dict[str, Dict[str, Any]], 
+        master_events: Dict[str, str]
+    ) -> Optional[str]:
+        """Find the master event ID for a recurrence override.
+        
+        Args:
+            override_event: The override event
+            grouped: Current grouped events
+            master_events: Mapping of UIDs to event IDs
+            
+        Returns:
+            Master event ID if found
+        """
+        # Try to find master by Google's recurringEventId
+        if hasattr(override_event, 'recurring_event_id') and override_event.recurring_event_id:
+            if override_event.recurring_event_id in grouped:
+                return override_event.recurring_event_id
+        
+        # Try to find master by UID (iCloud/iCal standard)
+        if override_event.uid and override_event.uid in master_events:
+            return master_events[override_event.uid]
+        
+        return None
+    
+    async def _fetch_google_change_set_with_retry(
+        self,
+        calendar_id: str,
+        sync_token: Optional[str],
+        time_min: datetime,
+        time_max: datetime,
+        last_sync_time: Optional[datetime],
+        calendar_mapping: CalendarMappingDB
+    ) -> ChangeSet[CalendarEvent]:
+        """Fetch Google change set with proper token invalidation handling.
+        
+        Args:
+            calendar_id: Google calendar ID
+            sync_token: Current sync token
+            time_min: Minimum time for events
+            time_max: Maximum time for events
+            last_sync_time: Last sync time
+            calendar_mapping: Calendar mapping for token updates
+            
+        Returns:
+            Change set with events
+            
+        Raises:
+            CalendarServiceError: If fetching fails after retry
+        """
+        try:
+            return await self.google_service.get_change_set(
+                calendar_id,
+                time_min=None if sync_token else time_min,
+                time_max=None if sync_token else time_max,
+                max_results=self.settings.sync_config.max_events_per_sync,
+                updated_min=None if sync_token else last_sync_time,
+                sync_token=sync_token
+            )
+        except GoogleCalendarService.TokenInvalid as e:
+            return await self._handle_google_token_invalidation(
+                calendar_id, time_min, time_max, calendar_mapping, e
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to fetch Google change set: {e}")
+            raise CalendarServiceError(f"Failed to fetch Google events from {calendar_id}: {e}")
+    
+    async def _handle_google_token_invalidation(
+        self,
+        calendar_id: str,
+        time_min: datetime,
+        time_max: datetime,
+        calendar_mapping: CalendarMappingDB,
+        original_error: Exception
+    ) -> ChangeSet[CalendarEvent]:
+        """Handle Google sync token invalidation with proper recovery.
+        
+        Args:
+            calendar_id: Google calendar ID
+            time_min: Minimum time for events
+            time_max: Maximum time for events
+            calendar_mapping: Calendar mapping to update
+            original_error: The original TokenInvalid error
+            
+        Returns:
+            Change set from fallback sync
+        """
+        self.logger.warning(
+            f"Google sync token invalid for calendar {calendar_id}: {original_error}. "
+            "Clearing token and performing full resync."
+        )
+        
+        # Clear invalid token and timestamp
+        try:
+            with self.db_manager.get_session() as session:
+                # Refresh the mapping object in this session
+                mapping = session.merge(calendar_mapping)
+                mapping.google_sync_token = None
+                mapping.google_last_updated = None
+                session.commit()
+                # Update the in-memory object too
+                calendar_mapping.google_sync_token = None
+                calendar_mapping.google_last_updated = None
+        except Exception as db_error:
+            self.logger.error(f"Failed to clear invalid Google sync token: {db_error}")
+            # Continue with sync anyway
+        
+        # Perform fallback sync without token
+        try:
+            g_cs = await self.google_service.get_change_set(
+                calendar_id,
+                time_min=time_min,
+                time_max=time_max,
+                max_results=self.settings.sync_config.max_events_per_sync,
+                updated_min=None,
+                sync_token=None
+            )
+            # Clear deletions during token recovery to avoid false positives
+            g_cs.deleted_native_ids = set()
+            return g_cs
+        except Exception as fallback_error:
+            self.logger.error(f"Fallback Google sync also failed: {fallback_error}")
+            raise CalendarServiceError(
+                f"Both sync token and fallback sync failed for Google calendar {calendar_id}"
+            )
+    
+    async def _map_icloud_hrefs_to_event_ids(
+        self,
+        deleted_hrefs: set[str],
+        mappings: List[EventMappingDB],
+        calendar_id: str
+    ) -> set[str]:
+        """Map iCloud resource HREFs to event IDs with improved logic.
+        
+        Args:
+            deleted_hrefs: Set of deleted resource HREFs
+            mappings: Existing event mappings
+            calendar_id: iCloud calendar ID
+            
+        Returns:
+            Set of mapped event IDs
+        """
+        if not deleted_hrefs:
+            return set()
+        
+        mapped_ids: set[str] = set()
+        href_to_id: Dict[str, str] = {}
+        normalized_mappings: Dict[str, str] = {}
+        
+        # Build mapping dictionaries
+        for mapping in mappings:
+            if mapping.icloud_resource_url and mapping.icloud_event_id:
+                # Direct mapping
+                href_to_id[mapping.icloud_resource_url] = mapping.icloud_event_id
+                
+                # Normalized mapping (extract filename for fuzzy matching)
+                normalized_url = self._normalize_resource_url(mapping.icloud_resource_url)
+                if normalized_url:
+                    normalized_mappings[normalized_url] = mapping.icloud_event_id
+        
+        matched_count = 0
+        unmatched_hrefs = []
+        
+        for href in deleted_hrefs:
+            mapped_id = None
+            
+            # 1. Exact match
+            if href in href_to_id:
+                mapped_id = href_to_id[href]
+                self.logger.debug(f"Exact match for href: {href}")
+            
+            # 2. Suffix matching (for relative vs absolute URLs)
+            elif not mapped_id:
+                for resource_url, event_id in href_to_id.items():
+                    if self._urls_match(href, resource_url):
+                        mapped_id = event_id
+                        self.logger.debug(f"Suffix match for href {href} -> {resource_url}")
+                        break
+            
+            # 3. Normalized/filename matching (last resort)
+            elif not mapped_id:
+                normalized_href = self._normalize_resource_url(href)
+                if normalized_href and normalized_href in normalized_mappings:
+                    mapped_id = normalized_mappings[normalized_href]
+                    self.logger.debug(f"Normalized match for href {href} -> {normalized_href}")
+            
+            if mapped_id:
+                mapped_ids.add(mapped_id)
+                matched_count += 1
+            else:
+                unmatched_hrefs.append(href)
+        
+        # Log mapping results
+        if matched_count > 0:
+            self.logger.info(f"Mapped {matched_count}/{len(deleted_hrefs)} iCloud deletion HREFs to event IDs")
+        
+        if unmatched_hrefs:
+            self.logger.warning(
+                f"Could not map {len(unmatched_hrefs)} iCloud deletion HREFs: "
+                f"{unmatched_hrefs[:3]}{'...' if len(unmatched_hrefs) > 3 else ''}"
+            )
+            # Store unmapped HREFs for manual investigation if needed
+            self._log_unmapped_hrefs(unmatched_hrefs, calendar_id)
+        
+        return mapped_ids
+    
+    def _normalize_resource_url(self, url: str) -> Optional[str]:
+        """Extract the resource identifier from a URL.
+        
+        Args:
+            url: Resource URL
+            
+        Returns:
+            Normalized identifier or None
+        """
+        if not url:
+            return None
+        
+        # Extract the last path component (usually the UID + .ics)
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            path_parts = parsed.path.strip('/').split('/')
+            if path_parts:
+                # Get the filename (e.g., "event-uid.ics")
+                filename = path_parts[-1]
+                # Remove .ics extension if present
+                if filename.endswith('.ics'):
+                    filename = filename[:-4]
+                return filename.lower()
+        except Exception as e:
+            self.logger.debug(f"Error normalizing URL {url}: {e}")
+        
+        return None
+    
+    def _urls_match(self, href1: str, href2: str) -> bool:
+        """Check if two URLs refer to the same resource.
+        
+        Args:
+            href1: First URL
+            href2: Second URL
+            
+        Returns:
+            True if URLs likely refer to the same resource
+        """
+        if not href1 or not href2:
+            return False
+        
+        # Exact match
+        if href1 == href2:
+            return True
+        
+        # One is suffix of the other (relative vs absolute)
+        if href1.endswith(href2) or href2.endswith(href1):
+            return True
+        
+        # Both end with the same path component
+        try:
+            from urllib.parse import urlparse
+            path1 = urlparse(href1).path.strip('/')
+            path2 = urlparse(href2).path.strip('/')
+            
+            if path1 and path2:
+                # Compare the last 2-3 path components
+                parts1 = path1.split('/')[-3:]
+                parts2 = path2.split('/')[-3:]
+                
+                # If the last few components match, likely the same resource
+                if len(parts1) >= 2 and len(parts2) >= 2:
+                    return parts1[-2:] == parts2[-2:]
+                    
+        except Exception:
+            pass
+        
+        return False
+    
+    def _log_unmapped_hrefs(self, unmapped_hrefs: List[str], calendar_id: str) -> None:
+        """Log unmapped HREFs for troubleshooting.
+        
+        Args:
+            unmapped_hrefs: List of HREFs that couldn't be mapped
+            calendar_id: Calendar ID for context
+        """
+        # Only log a few examples to avoid spam
+        examples = unmapped_hrefs[:5]
+        self.logger.info(
+            f"Unmapped iCloud HREFs for calendar {calendar_id[:20]}...: {examples}"
+        )
+        
+        # Log pattern analysis for troubleshooting
+        if examples:
+            patterns = set()
+            for href in examples:
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(href)
+                    pattern = f"{parsed.netloc}{'/'.join(parsed.path.split('/')[:-1])}"
+                    patterns.add(pattern)
+                except Exception:
+                    continue
+            
+            if patterns:
+                self.logger.debug(f"HREF patterns: {list(patterns)[:3]}")

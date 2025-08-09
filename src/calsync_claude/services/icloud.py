@@ -292,99 +292,6 @@ class iCloudCalendarService(BaseCalendarService):
                 raise CalendarServiceError(f"iCloud throttled: {e}")
             raise CalendarServiceError(f"Failed to get iCloud change set: {e}")
 
-    async def get_change_set(
-        self,
-        calendar_id: str,
-        time_min: Optional[datetime] = None,
-        time_max: Optional[datetime] = None,
-        max_results: Optional[int] = None,
-        updated_min: Optional[datetime] = None,
-        sync_token: Optional[str] = None,
-    ) -> ChangeSet:
-        """Return changed events and explicit deletions using CalDAV sync-collection when possible."""
-        self._ensure_authenticated()
-
-        # Defaults for initial backfill
-        if time_min is None:
-            time_min = datetime.now(pytz.UTC) - timedelta(days=self.settings.sync_config.sync_past_days)
-        if time_max is None:
-            time_max = datetime.now(pytz.UTC) + timedelta(days=self.settings.sync_config.sync_future_days)
-
-        try:
-            calendar = await self._find_calendar_by_id(calendar_id)
-            if not calendar:
-                raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
-
-            changed: Dict[str, CalendarEvent] = {}
-            deleted_ids: set[str] = set()
-            next_token: Optional[str] = None
-
-            if sync_token:
-                # Use sync-collection
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: calendar.calendar_home_set.client.request(
-                        calendar.url,
-                        "REPORT",
-                        f"""<?xml version=\"1.0\" encoding=\"utf-8\" ?>
-<D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
-  <D:sync-token>{sync_token}</D:sync-token>
-  <D:sync-level>1</D:sync-level>
-  <D:prop>
-    <D:getetag/>
-    <C:calendar-data/>
-  </D:prop>
-</D:sync-collection>""",
-                        headers={"Content-Type": "application/xml; charset=utf-8"}
-                    )
-                )
-
-                # Parse XML for changes and deletions
-                events, deleted_hrefs, extracted_next = await self._parse_sync_collection_for_changes(response, calendar)
-                next_token = extracted_next
-
-                for ev in events:
-                    parsed = self._parse_caldav_event(ev)
-                    if parsed:
-                        changed[parsed.id] = parsed
-
-                # Map deleted hrefs to event ids using resource URL mapping later in engine
-                # For now, expose hrefs directly; engine will translate via DB
-                for href in deleted_hrefs:
-                    deleted_ids.add(href)  # Temporarily store hrefs; engine will map to IDs
-            else:
-                # Initial backfill: list events in range
-                events = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: calendar.date_search(start=time_min, end=time_max)
-                )
-                count = 0
-                for ev in events:
-                    if max_results and count >= max_results:
-                        break
-                    parsed = self._parse_caldav_event(ev)
-                    if parsed:
-                        if updated_min and parsed.updated < updated_min:
-                            continue
-                        changed[parsed.id] = parsed
-                        count += 1
-
-                # Try to fetch a token for next run
-                try:
-                    next_token = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: calendar.get_ctag()
-                    )
-                except Exception:
-                    next_token = None
-
-            return ChangeSet(changed=changed, deleted_ids=deleted_ids, next_sync_token=next_token)
-        except Exception as e:
-            if "401" in str(e) or "unauthor" in str(e).lower():
-                raise AuthenticationError("iCloud authentication failed. Ensure an app-specific password is set. Prefer storing it in macOS Keychain.")
-            if "429" in str(e) or "throttl" in str(e).lower():
-                raise CalendarServiceError(f"iCloud throttled: {e}")
-            raise CalendarServiceError(f"Failed to get iCloud change set: {e}")
     
     async def get_event(self, calendar_id: str, event_id: str) -> CalendarEvent:
         """Get a specific iCloud Calendar event."""
@@ -628,10 +535,10 @@ class iCloudCalendarService(BaseCalendarService):
             start_dt = dtstart.dt
             all_day = not isinstance(start_dt, datetime)
             
-            # Handle timezone extraction
+            # Handle timezone extraction and validation
             timezone = None
             if not all_day and hasattr(start_dt, 'tzinfo') and start_dt.tzinfo:
-                timezone = str(start_dt.tzinfo)
+                timezone = self._validate_and_extract_timezone(start_dt.tzinfo)
             
             # Convert to datetime and handle all-day events
             if all_day:
@@ -642,13 +549,10 @@ class iCloudCalendarService(BaseCalendarService):
                 else:
                     end_dt = start_dt + timedelta(days=1)
             else:
-                # Ensure timezone-aware datetimes
-                if start_dt.tzinfo is None:
-                    start_dt = start_dt.replace(tzinfo=pytz.UTC)
+                # Ensure timezone-aware datetimes with proper validation
+                start_dt = self._ensure_timezone_aware(start_dt)
                 if dtend:
-                    end_dt = dtend.dt
-                    if end_dt.tzinfo is None:
-                        end_dt = end_dt.replace(tzinfo=pytz.UTC)
+                    end_dt = self._ensure_timezone_aware(dtend.dt)
                 else:
                     end_dt = start_dt + timedelta(hours=1)
             
@@ -1095,3 +999,62 @@ class iCloudCalendarService(BaseCalendarService):
         except Exception as e:
             self.logger.error(f"Failed to get iCloud calendar info: {e}")
             return None
+    
+    def _validate_and_extract_timezone(self, tzinfo) -> Optional[str]:
+        """Validate and extract timezone string from tzinfo object.
+        
+        Args:
+            tzinfo: Timezone info object
+            
+        Returns:
+            Valid IANA timezone string or None
+        """
+        try:
+            timezone_str = str(tzinfo)
+            
+            # Handle common timezone formats
+            if hasattr(tzinfo, 'zone'):
+                # pytz timezone
+                timezone_str = tzinfo.zone
+            elif timezone_str.startswith('UTC'):
+                timezone_str = 'UTC'
+            elif timezone_str in ['CET', 'EST', 'PST', 'MST']:
+                # Common abbreviations - convert to IANA
+                timezone_map = {
+                    'CET': 'Europe/Berlin',
+                    'EST': 'America/New_York',
+                    'PST': 'America/Los_Angeles',
+                    'MST': 'America/Denver'
+                }
+                timezone_str = timezone_map.get(timezone_str, 'UTC')
+            
+            # Validate it's a known timezone
+            try:
+                pytz.timezone(timezone_str)
+                return timezone_str
+            except pytz.exceptions.UnknownTimeZoneError:
+                self.logger.warning(f"Unknown timezone: {timezone_str}, defaulting to UTC")
+                return 'UTC'
+                
+        except Exception as e:
+            self.logger.warning(f"Error extracting timezone: {e}, defaulting to UTC")
+            return 'UTC'
+    
+    def _ensure_timezone_aware(self, dt: datetime) -> datetime:
+        """Ensure datetime is timezone-aware.
+        
+        Args:
+            dt: Datetime object
+            
+        Returns:
+            Timezone-aware datetime
+        """
+        if dt.tzinfo is None:
+            # Naive datetime - assume UTC
+            return dt.replace(tzinfo=pytz.UTC)
+        elif dt.tzinfo.utcoffset(dt) is None:
+            # Invalid timezone info
+            return dt.replace(tzinfo=pytz.UTC)
+        else:
+            # Already timezone-aware
+            return dt
