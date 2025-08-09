@@ -1,3 +1,4 @@
+# src/calsync_claude/config.py
 """Enhanced configuration management using Pydantic Settings."""
 
 import os
@@ -17,7 +18,9 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore"
+        extra="ignore",
+        # New: allow reading credentials directly from files in this directory
+        secrets_dir=os.getenv("SECRETS_DIR", "/run/secrets")
     )
     
     # Google Calendar API Configuration
@@ -299,7 +302,7 @@ SYNC_CONFIG__CONFLICT_RESOLUTION=manual
 SYNC_CONFIG__MAX_EVENTS_PER_SYNC=1000
 SYNC_CONFIG__SYNC_PAST_DAYS=30
 SYNC_CONFIG__SYNC_FUTURE_DAYS=365
-SYNC_CONFIG__RETRY_ATTEMPTS=3
+SYNC_CONFIG__RETRY_ATTEMPTSBOARD=3
 SYNC_CONFIG__RETRY_DELAY_SECONDS=5
 SYNC_CONFIG__ENABLE_WEBHOOKS=false
 SYNC_CONFIG__WEBHOOK_PORT=8080
