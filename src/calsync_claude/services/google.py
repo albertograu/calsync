@@ -16,7 +16,7 @@ import pytz
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .base import BaseCalendarService, CalendarServiceError, AuthenticationError, EventNotFoundError
-from ..models import CalendarEvent, CalendarInfo, EventSource
+from ..models import CalendarEvent, CalendarInfo, EventSource, ChangeSet
 from ..config import Settings
 
 
@@ -225,6 +225,9 @@ class GoogleCalendarService(BaseCalendarService):
                 
                 # Process events
                 for event_data in events_result.get('items', []):
+                    # Skip cancelled events here; deletions are handled in get_change_set
+                    if event_data.get('status') == 'cancelled':
+                        continue
                     if max_results and events_yielded >= max_results:
                         return
                     
@@ -254,6 +257,96 @@ class GoogleCalendarService(BaseCalendarService):
             raise CalendarServiceError(f"Failed to get Google events: {e}")
         except Exception as e:
             raise CalendarServiceError(f"Failed to get Google events: {e}")
+
+    async def get_change_set(
+        self,
+        calendar_id: str,
+        time_min: Optional[datetime] = None,
+        time_max: Optional[datetime] = None,
+        max_results: Optional[int] = None,
+        updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
+    ) -> ChangeSet:
+        """Return changed events and explicit deletions. Handles Google 410 token reset."""
+        self._ensure_authenticated()
+        changed: Dict[str, CalendarEvent] = {}
+        deleted_ids: set[str] = set()
+        next_sync_token: Optional[str] = None
+        page_token: Optional[str] = None
+
+        def _build_params() -> Dict[str, Any]:
+            params: Dict[str, Any] = {
+                'calendarId': calendar_id,
+                'maxResults': min(250, max_results or 250)
+            }
+            if sync_token:
+                params['syncToken'] = sync_token
+            else:
+                nonlocal time_min, time_max
+                if time_min is None:
+                    time_min = datetime.now(pytz.UTC) - timedelta(days=self.settings.sync_config.sync_past_days)
+                if time_max is None:
+                    time_max = datetime.now(pytz.UTC) + timedelta(days=self.settings.sync_config.sync_future_days)
+                params.update({
+                    'timeMin': time_min.isoformat(),
+                    'timeMax': time_max.isoformat(),
+                    'singleEvents': True,
+                    'orderBy': 'startTime'
+                })
+                if updated_min:
+                    params['updatedMin'] = updated_min.isoformat()
+            if page_token:
+                params['pageToken'] = page_token
+            return params
+
+        try:
+            while True:
+                params = _build_params()
+                try:
+                    events_result = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.service.events().list(**params).execute()
+                    )
+                except HttpError as e:
+                    if e.resp.status == 429:
+                        self.logger.warning("Google API rate limited, retrying...")
+                        raise CalendarServiceError(f"Rate limited: {e}")
+                    if e.resp.status == 410 and sync_token:
+                        # Invalid/expired token
+                        self.logger.warning("Google sync token expired/invalid (410).")
+                        raise CalendarServiceError("SYNC_TOKEN_INVALID")
+                    raise
+
+                for event_data in events_result.get('items', []):
+                    status = event_data.get('status')
+                    event_id = event_data.get('id')
+                    if status == 'cancelled':
+                        if event_id:
+                            deleted_ids.add(event_id)
+                        continue
+                    try:
+                        ev = self._format_google_event(event_data)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to format Google event {event_id}: {e}")
+                        continue
+                    changed[ev.id] = ev
+
+                page_token = events_result.get('nextPageToken')
+                next_sync_token = events_result.get('nextSyncToken') or next_sync_token
+                if not page_token:
+                    break
+
+            # Expose token via callback for legacy callers
+            if next_sync_token and hasattr(self, '_current_sync_token_callback'):
+                self._current_sync_token_callback(next_sync_token)
+
+            return ChangeSet(changed=changed, deleted_ids=deleted_ids, next_sync_token=next_sync_token)
+        except HttpError as e:
+            if e.resp.status == 404:
+                raise CalendarServiceError(f"Google calendar {calendar_id} not found")
+            raise CalendarServiceError(f"Failed to get Google change set: {e}")
+        except Exception as e:
+            raise CalendarServiceError(f"Failed to get Google change set: {e}")
     
     async def get_event(self, calendar_id: str, event_id: str) -> CalendarEvent:
         """Get a specific Google Calendar event."""

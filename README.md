@@ -5,6 +5,7 @@ An advanced two-way calendar synchronization tool that keeps your Google Calenda
 ## 🚀 Key Features
 
 ### Core Functionality
+
 - **Bidirectional Sync**: Real-time synchronization between Google Calendar and iCloud
 - **Conflict Resolution**: Smart handling of conflicting changes with multiple strategies
 - **Async Operations**: High-performance async I/O for faster synchronization
@@ -12,6 +13,7 @@ An advanced two-way calendar synchronization tool that keeps your Google Calenda
 - **Dry-Run Mode**: Preview changes before applying them
 
 ### Advanced Features
+
 - **SQLite Database**: Persistent storage for sync state and event mappings
 - **Rich CLI Interface**: Beautiful command-line interface with progress indicators
 - **Structured Logging**: Comprehensive logging with structured output
@@ -20,6 +22,7 @@ An advanced two-way calendar synchronization tool that keeps your Google Calenda
 - **Health Monitoring**: Connection testing and sync status reporting
 
 ### Reliability & Performance
+
 - **Retry Logic**: Automatic retries with exponential backoff
 - **Rate Limiting**: Respects API rate limits for both services
 - **Error Recovery**: Graceful handling of network issues and API errors
@@ -28,7 +31,50 @@ An advanced two-way calendar synchronization tool that keeps your Google Calenda
 
 ## 🔧 Installation
 
+### Docker
+
+This project ships with a Dockerfile and docker-compose for easy deployment on a VPS.
+
+1. Prepare environment variables (recommended via `.env` alongside `docker-compose.yml`):
+
+```
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+ICLOUD_USERNAME=your_icloud_email@icloud.com
+ICLOUD_PASSWORD=your_app_specific_password
+LOG_LEVEL=INFO
+SYNC_INTERVAL_MINUTES=30
+```
+
+2. Build and run:
+
+```
+docker compose up -d --build
+```
+
+3. Volumes:
+
+- `./data` stores the SQLite database and runtime state
+- `./credentials` stores Google OAuth credentials/token files
+
+4. One-off sync (instead of daemon):
+
+```
+docker compose run --rm calsync sync
+```
+
+Security notes:
+
+- Use an app-specific password for iCloud and consider Docker/Kubernetes secrets or a password manager.
+- The container writes credentials to `/credentials` (mounted to `./credentials`). Protect this path.
+
+Token handling & deletions:
+
+- Uses true incremental sync tokens on both sides. If Google returns 410 (invalid token), the app clears the token and does a safe backfill without processing deletions until a new token is minted.
+- Deletions are processed only when valid sync tokens are present. iCloud deletions are detected via CalDAV sync-collection and mapped via stored resource URLs.
+
 ### Prerequisites
+
 - Python 3.9 or higher
 - Google Calendar API access
 - iCloud account with app-specific password
@@ -201,6 +247,7 @@ calsync-claude reset
 ## 🏗️ Architecture
 
 ### Modern Python Stack
+
 - **Pydantic**: Data validation and settings management
 - **SQLAlchemy**: Database ORM with async support
 - **Rich**: Beautiful terminal interfaces
@@ -226,8 +273,9 @@ calsync-claude reset
 ```
 
 ### Database Schema
+
 - **event_mappings**: Maps events between Google and iCloud
-- **sync_sessions**: Tracks sync runs and statistics  
+- **sync_sessions**: Tracks sync runs and statistics
 - **sync_operations**: Individual sync operations
 - **conflicts**: Unresolved conflicts requiring attention
 - **config**: Persistent configuration storage
@@ -298,12 +346,14 @@ alembic upgrade head
 ## 📊 Monitoring & Observability
 
 ### Structured Logging
+
 - JSON formatted logs for production
 - Human-readable logs for development
 - Configurable log levels
 - Request/response tracing
 
 ### Metrics & Statistics
+
 - Sync success rates
 - Operation counts (created/updated/deleted)
 - Performance timing
@@ -311,6 +361,7 @@ alembic upgrade head
 - Conflict statistics
 
 ### Health Checks
+
 - Calendar service connectivity
 - Database health
 - Sync status reporting
@@ -321,6 +372,7 @@ alembic upgrade head
 ### Common Issues
 
 **Authentication Errors**
+
 ```bash
 # Re-authenticate Google Calendar
 rm ~/.calsync-claude/credentials/google_token.json
@@ -328,11 +380,13 @@ calsync-claude test
 ```
 
 **iCloud Connection Issues**
+
 - Verify app-specific password is used (not regular iCloud password)
 - Ensure two-factor authentication is enabled
 - Check iCloud server URL configuration
 
 **Sync Conflicts**
+
 ```bash
 # View conflicts
 calsync-claude conflicts
@@ -342,6 +396,7 @@ calsync-claude reset
 ```
 
 **Database Issues**
+
 ```bash
 # Reset database
 calsync-claude reset
@@ -363,12 +418,14 @@ calsync-claude config validate
 ## 🔐 Security
 
 ### Credential Storage
+
 - OAuth tokens stored securely in user directory
 - App-specific passwords (never regular passwords)
 - No credentials sent to third parties
 - Local-only synchronization
 
 ### Best Practices
+
 - Use app-specific passwords for iCloud
 - Regularly rotate API credentials
 - Monitor sync logs for suspicious activity
@@ -376,18 +433,18 @@ calsync-claude config validate
 
 ## 📈 Comparison with Original
 
-| Feature | Original CalSync | CalSync Claude |
-|---------|------------------|----------------|
-| Architecture | Synchronous | Async/await |
-| Database | JSON files | SQLite with ORM |
-| CLI | Basic click | Rich interface |
-| Conflict Resolution | Simple | Advanced strategies |
-| Error Handling | Basic | Retry with backoff |
-| Logging | Print statements | Structured logging |
-| Testing | None | Comprehensive suite |
-| Configuration | Environment only | Pydantic settings |
-| Performance | Sequential | Concurrent operations |
-| Monitoring | Limited | Comprehensive metrics |
+| Feature             | Original CalSync | CalSync Claude        |
+| ------------------- | ---------------- | --------------------- |
+| Architecture        | Synchronous      | Async/await           |
+| Database            | JSON files       | SQLite with ORM       |
+| CLI                 | Basic click      | Rich interface        |
+| Conflict Resolution | Simple           | Advanced strategies   |
+| Error Handling      | Basic            | Retry with backoff    |
+| Logging             | Print statements | Structured logging    |
+| Testing             | None             | Comprehensive suite   |
+| Configuration       | Environment only | Pydantic settings     |
+| Performance         | Sequential       | Concurrent operations |
+| Monitoring          | Limited          | Comprehensive metrics |
 
 ## 📝 License
 

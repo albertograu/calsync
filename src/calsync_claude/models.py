@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Set
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, validator
@@ -335,3 +335,15 @@ class SyncConfiguration(BaseModel):
     def has_explicit_pairs(self) -> bool:
         """Check if explicit calendar pairs are configured."""
         return bool(self.calendar_pairs)
+
+
+class ChangeSet(BaseModel):
+    """Represents an incremental change set from a calendar source.
+    
+    - changed: map of event_id -> CalendarEvent for created/updated events
+    - deleted_ids: set of event_ids that were deleted on the source
+    - next_sync_token: token to use for next incremental sync, if provided
+    """
+    changed: Dict[str, CalendarEvent] = Field(default_factory=dict)
+    deleted_ids: Set[str] = Field(default_factory=set)
+    next_sync_token: Optional[str] = None

@@ -14,7 +14,7 @@ from icalendar import Calendar, Event as ICalEvent
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .base import BaseCalendarService, CalendarServiceError, AuthenticationError, EventNotFoundError
-from ..models import CalendarEvent, CalendarInfo, EventSource
+from ..models import CalendarEvent, CalendarInfo, EventSource, ChangeSet
 from ..config import Settings
 
 
@@ -156,7 +156,7 @@ class iCloudCalendarService(BaseCalendarService):
             try:
                 if sync_token:
                     # Use CalDAV sync-collection for true incremental sync
-                    # This requires WebDAV PROPFIND with sync-collection
+                    # This returns only changed events; deletions will be exposed via get_change_set
                     events = await self._get_events_with_sync_token(calendar, sync_token)
                 else:
                     # Fallback to date search for initial sync
@@ -192,6 +192,100 @@ class iCloudCalendarService(BaseCalendarService):
                     
         except Exception as e:
             raise CalendarServiceError(f"Failed to get iCloud events: {e}")
+
+    async def get_change_set(
+        self,
+        calendar_id: str,
+        time_min: Optional[datetime] = None,
+        time_max: Optional[datetime] = None,
+        max_results: Optional[int] = None,
+        updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
+    ) -> ChangeSet:
+        """Return changed events and explicit deletions using CalDAV sync-collection when possible."""
+        self._ensure_authenticated()
+
+        # Defaults for initial backfill
+        if time_min is None:
+            time_min = datetime.now(pytz.UTC) - timedelta(days=self.settings.sync_config.sync_past_days)
+        if time_max is None:
+            time_max = datetime.now(pytz.UTC) + timedelta(days=self.settings.sync_config.sync_future_days)
+
+        try:
+            calendar = await self._find_calendar_by_id(calendar_id)
+            if not calendar:
+                raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
+
+            changed: Dict[str, CalendarEvent] = {}
+            deleted_ids: set[str] = set()
+            next_token: Optional[str] = None
+
+            if sync_token:
+                # Use sync-collection
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.calendar_home_set.client.request(
+                        calendar.url,
+                        "REPORT",
+                        f"""<?xml version=\"1.0\" encoding=\"utf-8\" ?>
+<D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
+  <D:sync-token>{sync_token}</D:sync-token>
+  <D:sync-level>1</D:sync-level>
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+</D:sync-collection>""",
+                        headers={"Content-Type": "application/xml; charset=utf-8"}
+                    )
+                )
+
+                # Parse XML for changes and deletions
+                events, deleted_hrefs, extracted_next = await self._parse_sync_collection_for_changes(response, calendar)
+                next_token = extracted_next
+
+                for ev in events:
+                    parsed = self._parse_caldav_event(ev)
+                    if parsed:
+                        changed[parsed.id] = parsed
+
+                # Map deleted hrefs to event ids using resource URL mapping later in engine
+                # For now, expose hrefs directly; engine will translate via DB
+                for href in deleted_hrefs:
+                    deleted_ids.add(href)  # Temporarily store hrefs; engine will map to IDs
+            else:
+                # Initial backfill: list events in range
+                events = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.date_search(start=time_min, end=time_max)
+                )
+                count = 0
+                for ev in events:
+                    if max_results and count >= max_results:
+                        break
+                    parsed = self._parse_caldav_event(ev)
+                    if parsed:
+                        if updated_min and parsed.updated < updated_min:
+                            continue
+                        changed[parsed.id] = parsed
+                        count += 1
+
+                # Try to fetch a token for next run
+                try:
+                    next_token = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: calendar.get_ctag()
+                    )
+                except Exception:
+                    next_token = None
+
+            return ChangeSet(changed=changed, deleted_ids=deleted_ids, next_sync_token=next_token)
+        except Exception as e:
+            if "401" in str(e) or "unauthor" in str(e).lower():
+                raise AuthenticationError("iCloud authentication failed. Ensure an app-specific password is set. Prefer storing it in macOS Keychain.")
+            if "429" in str(e) or "throttl" in str(e).lower():
+                raise CalendarServiceError(f"iCloud throttled: {e}")
+            raise CalendarServiceError(f"Failed to get iCloud change set: {e}")
     
     async def get_event(self, calendar_id: str, event_id: str) -> CalendarEvent:
         """Get a specific iCloud Calendar event."""
@@ -609,7 +703,10 @@ class iCloudCalendarService(BaseCalendarService):
             )
     
     async def _parse_sync_collection_response(self, response, calendar):
-        """Parse CalDAV sync-collection XML response to extract events and deletions."""
+        """Parse CalDAV sync-collection XML response to extract events.
+
+        DEPRECATED: use _parse_sync_collection_for_changes for change sets.
+        """
         import xml.etree.ElementTree as ET
         
         try:
@@ -670,6 +767,48 @@ class iCloudCalendarService(BaseCalendarService):
                 None,
                 lambda: calendar.events()
             )
+
+    async def _parse_sync_collection_for_changes(self, response, calendar):
+        """Parse CalDAV sync-collection XML to return (events, deleted_hrefs, next_sync_token)."""
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(response.content.decode('utf-8'))
+            namespaces = {
+                'D': 'DAV:',
+                'C': 'urn:ietf:params:xml:ns:caldav'
+            }
+            events = []
+            deleted_hrefs: List[str] = []
+            next_token = None
+
+            # Next token may appear in D:sync-token
+            token_elem = root.find('.//D:sync-token', namespaces)
+            if token_elem is not None and token_elem.text:
+                next_token = token_elem.text
+
+            for response_elem in root.findall('.//D:response', namespaces):
+                href_elem = response_elem.find('D:href', namespaces)
+                if href_elem is None:
+                    continue
+                href = href_elem.text
+
+                status_elem = response_elem.find('.//D:status', namespaces)
+                if status_elem is not None and '404' in status_elem.text:
+                    deleted_hrefs.append(href)
+                    continue
+
+                calendar_data_elem = response_elem.find('.//C:calendar-data', namespaces)
+                if calendar_data_elem is not None and calendar_data_elem.text:
+                    class MockCalDAVEvent:
+                        def __init__(self, data, url):
+                            self.data = data
+                            self.url = url
+                    events.append(MockCalDAVEvent(calendar_data_elem.text, href))
+
+            return events, deleted_hrefs, next_token
+        except Exception as e:
+            self.logger.error(f"Failed to parse sync-collection for changes: {e}")
+            return await self._parse_sync_collection_response(response, calendar), [], None
         except Exception as e:
             self.logger.error(f"Error parsing sync-collection response: {e}")
             # Fall back to regular events query

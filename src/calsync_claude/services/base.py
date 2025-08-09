@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, AsyncIterator
 import logging
 
-from ..models import CalendarEvent, CalendarInfo, EventSource
+from ..models import CalendarEvent, CalendarInfo, EventSource, ChangeSet
 from ..config import Settings
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,31 @@ class BaseCalendarService(ABC):
             
         Raises:
             CalendarServiceError: If events cannot be retrieved
+        """
+        pass
+
+    @abstractmethod
+    async def get_change_set(
+        self,
+        calendar_id: str,
+        time_min: Optional[datetime] = None,
+        time_max: Optional[datetime] = None,
+        max_results: Optional[int] = None,
+        updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
+    ) -> ChangeSet:
+        """Get an incremental change set from a calendar.
+        
+        Args:
+            calendar_id: Calendar ID
+            time_min: Optional start time for initial backfill
+            time_max: Optional end time for initial backfill
+            max_results: Optional cap
+            updated_min: Optional filter for initial backfill
+            sync_token: If present, do a true incremental sync returning only changes and deletions
+        
+        Returns:
+            ChangeSet containing changed events, deleted IDs, and next sync token when available
         """
         pass
     
