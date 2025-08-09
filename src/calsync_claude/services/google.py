@@ -179,13 +179,15 @@ class GoogleCalendarService(BaseCalendarService):
                     'maxResults': min(250, max_results or 250)
                 }
                 
-                # Use sync token for incremental sync if available
+                # CRITICAL: Use sync token for true incremental sync when available
                 if sync_token:
-                    # Sync token mode - gets all changes since last sync
+                    # Sync token mode - gets ALL changes since last sync (including deletes)
                     params['syncToken'] = sync_token
-                    # Don't use time filters with sync tokens
+                    # IMPORTANT: Do NOT use time filters with sync tokens
+                    # Sync tokens return all events that changed, regardless of time
                 else:
-                    # Time window mode - fallback for initial sync
+                    # Time window mode - ONLY for initial sync
+                    # WARNING: This mode cannot detect deletions reliably
                     if time_min is None:
                         time_min = datetime.now(pytz.UTC) - timedelta(
                             days=self.settings.sync_config.sync_past_days
@@ -202,6 +204,7 @@ class GoogleCalendarService(BaseCalendarService):
                         'orderBy': 'startTime'
                     })
                     
+                    # NOTE: updatedMin is redundant with sync tokens but useful for time windows
                     if updated_min:
                         params['updatedMin'] = updated_min.isoformat()
                 
@@ -388,8 +391,20 @@ class GoogleCalendarService(BaseCalendarService):
         
         # Extract recurrence information
         recurrence_rule = None
+        recurrence_overrides = []
         if 'recurrence' in event_data and event_data['recurrence']:
             recurrence_rule = event_data['recurrence'][0]  # First RRULE
+        
+        # CRITICAL: Handle Google's RECURRENCE-ID overrides
+        if 'recurringEventId' in event_data and event_data['recurringEventId']:
+            # This is a recurrence override event in Google Calendar
+            recurrence_overrides.append({
+                'type': 'recurrence-id',
+                'recurrence_id': start_dt.isoformat(),  # Use start time as recurrence ID
+                'is_override': True,
+                'master_event_id': event_data['recurringEventId'],
+                'original_start': event_data.get('originalStartTime', {}).get('dateTime', start_dt.isoformat())
+            })
         
         # Generate or use UID - Google events use iCalUID for deduplication
         uid = event_data.get('iCalUID', f"google-{event_data['id']}")
@@ -411,6 +426,7 @@ class GoogleCalendarService(BaseCalendarService):
             sequence=event_data.get('sequence', 0),
             recurring_event_id=event_data.get('recurringEventId'),
             recurrence_rule=recurrence_rule,
+            recurrence_overrides=recurrence_overrides,
             organizer=event_data.get('organizer'),
             attendees=attendees,
             original_data=event_data
@@ -452,6 +468,20 @@ class GoogleCalendarService(BaseCalendarService):
         if event.recurrence_rule:
             google_event['recurrence'] = [event.recurrence_rule]
         
+        # CRITICAL: Handle recurrence overrides properly
+        if event.recurrence_overrides:
+            for override in event.recurrence_overrides:
+                if override.get('type') == 'recurrence-id' and override.get('is_override'):
+                    # This is a recurrence exception - set the recurringEventId
+                    if override.get('master_event_id'):
+                        google_event['recurringEventId'] = override['master_event_id']
+                    
+                    # Set original start time for Google Calendar
+                    if override.get('original_start'):
+                        google_event['originalStartTime'] = {
+                            'dateTime': override['original_start']
+                        }
+        
         # Add attendees if present
         if event.attendees:
             google_event['attendees'] = []
@@ -470,3 +500,189 @@ class GoogleCalendarService(BaseCalendarService):
         """Clean up resources."""
         if self._http_client:
             await self._http_client.aclose()
+    
+    async def get_sync_token(self, calendar_id: str) -> str:
+        """Get a sync token for incremental sync.
+        
+        Args:
+            calendar_id: Google calendar ID
+            
+        Returns:
+            Sync token for future incremental calls
+        """
+        self._ensure_authenticated()
+        
+        try:
+            # Get a sync token by doing a minimal query
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().list(
+                    calendarId=calendar_id,
+                    maxResults=1,
+                    singleEvents=True
+                ).execute()
+            )
+            
+            sync_token = result.get('nextSyncToken')
+            if not sync_token:
+                raise CalendarServiceError("No sync token returned from Google Calendar API")
+                
+            return sync_token
+            
+        except HttpError as e:
+            if e.resp.status == 404:
+                raise CalendarServiceError(f"Google calendar {calendar_id} not found")
+            raise CalendarServiceError(f"Failed to get sync token: {e}")
+        except Exception as e:
+            raise CalendarServiceError(f"Failed to get sync token: {e}")
+    
+    async def test_connection(self) -> Dict[str, Any]:
+        """Test Google Calendar API connection.
+        
+        Returns:
+            Dictionary with connection test results
+        """
+        try:
+            if not self._authenticated:
+                await self.authenticate()
+            
+            # Try to get calendars as connection test
+            calendars = await self.get_calendars()
+            
+            return {
+                'success': True,
+                'calendars_found': len(calendars),
+                'authenticated': self._authenticated,
+                'credentials_path': str(self.settings.google_credentials_path),
+                'token_path': str(self.settings.google_token_path)
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'authenticated': self._authenticated,
+                'credentials_path': str(self.settings.google_credentials_path),
+                'token_path': str(self.settings.google_token_path)
+            }
+    
+    def _ensure_authenticated(self) -> None:
+        """Ensure service is authenticated, raise error if not."""
+        if not self._authenticated:
+            raise CalendarServiceError("Google service not authenticated. Call authenticate() first.")
+    
+    async def get_calendar_info(self, calendar_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed calendar information.
+        
+        Args:
+            calendar_id: Google calendar ID
+            
+        Returns:
+            Dictionary with calendar details or None if not found
+        """
+        self._ensure_authenticated()
+        
+        try:
+            calendar_data = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.calendars().get(calendarId=calendar_id).execute()
+            )
+            
+            return {
+                'id': calendar_data['id'],
+                'summary': calendar_data.get('summary', 'Unknown'),
+                'description': calendar_data.get('description'),
+                'location': calendar_data.get('location'),
+                'timeZone': calendar_data.get('timeZone'),
+                'etag': calendar_data.get('etag'),
+                'kind': calendar_data.get('kind')
+            }
+            
+        except HttpError as e:
+            if e.resp.status == 404:
+                return None
+            self.logger.error(f"Failed to get Google calendar info: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to get Google calendar info: {e}")
+            return None
+    
+    def _format_datetime_for_google(self, dt: datetime, all_day: bool = False) -> Dict[str, str]:
+        """Format datetime for Google Calendar API.
+        
+        Args:
+            dt: Datetime object
+            all_day: Whether this is an all-day event
+            
+        Returns:
+            Dictionary with formatted datetime
+        """
+        if all_day:
+            return {'date': dt.strftime('%Y-%m-%d')}
+        else:
+            return {'dateTime': dt.isoformat()}
+    
+    async def list_upcoming_events(
+        self, 
+        calendar_id: str, 
+        max_results: int = 10,
+        time_min: Optional[datetime] = None
+    ) -> List[CalendarEvent]:
+        """Get upcoming events from a Google calendar.
+        
+        Args:
+            calendar_id: Google calendar ID
+            max_results: Maximum number of events to return
+            time_min: Minimum time for events (default: now)
+            
+        Returns:
+            List of upcoming calendar events
+        """
+        if time_min is None:
+            time_min = datetime.now(pytz.UTC)
+        
+        events = []
+        async for event in self.get_events(
+            calendar_id, 
+            time_min=time_min,
+            max_results=max_results
+        ):
+            events.append(event)
+            
+        return events
+    
+    async def batch_update_events(
+        self,
+        calendar_id: str,
+        event_updates: List[Tuple[str, CalendarEvent]]
+    ) -> List[Dict[str, Any]]:
+        """Update multiple events in batch.
+        
+        Args:
+            calendar_id: Google calendar ID
+            event_updates: List of (event_id, event_data) tuples
+            
+        Returns:
+            List of update results
+        """
+        results = []
+        
+        # Google Calendar API doesn't have native batch update for events
+        # Process sequentially with rate limiting
+        for event_id, event_data in event_updates:
+            try:
+                updated_event = await self.update_event(calendar_id, event_id, event_data)
+                results.append({
+                    'event_id': event_id,
+                    'success': True,
+                    'updated_event': updated_event
+                })
+            except Exception as e:
+                results.append({
+                    'event_id': event_id,
+                    'success': False,
+                    'error': str(e)
+                })
+                
+        return results

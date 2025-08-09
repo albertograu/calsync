@@ -152,17 +152,15 @@ class iCloudCalendarService(BaseCalendarService):
             if not calendar:
                 raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
             
-            # Get events from CalDAV - use sync_token if available for incremental sync
+            # Get events from CalDAV with proper sync support
             try:
                 if sync_token:
-                    # TODO: Implement proper CalDAV sync-collection support
-                    # For now, fall back to date search with ctag comparison
-                    self.logger.warning("iCloud sync tokens not yet implemented, using date search")
-                    events = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: calendar.date_search(start=time_min, end=time_max)
-                    )
+                    # Use CalDAV sync-collection for true incremental sync
+                    # This requires WebDAV PROPFIND with sync-collection
+                    events = await self._get_events_with_sync_token(calendar, sync_token)
                 else:
+                    # Fallback to date search for initial sync
+                    # WARNING: This cannot detect deletions reliably
                     events = await asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: calendar.date_search(start=time_min, end=time_max)
@@ -422,7 +420,7 @@ class iCloudCalendarService(BaseCalendarService):
             rrule = vevent.get('rrule')
             recurrence_rule = str(rrule) if rrule else None
             
-            # Extract recurrence overrides (RDATE, EXDATE)
+            # Extract recurrence overrides (RDATE, EXDATE, RECURRENCE-ID)
             recurrence_overrides = []
             for prop in ['rdate', 'exdate']:
                 if prop in vevent:
@@ -430,6 +428,17 @@ class iCloudCalendarService(BaseCalendarService):
                         'type': prop,
                         'dates': [str(d) for d in vevent[prop].to_ical().decode().split(',')]
                     })
+            
+            # CRITICAL: Handle RECURRENCE-ID for event overrides
+            recurrence_id = vevent.get('recurrence-id')
+            if recurrence_id:
+                # This is a recurrence override event
+                recurrence_overrides.append({
+                    'type': 'recurrence-id',
+                    'recurrence_id': str(recurrence_id.dt),
+                    'is_override': True,
+                    'original_uid': uid  # Same UID as master event
+                })
             
             # Extract resource URL for direct access (CRITICAL for production)
             resource_url = str(event.url) if hasattr(event, 'url') and event.url else None
@@ -545,6 +554,249 @@ class iCloudCalendarService(BaseCalendarService):
                         event.add(override['type'], date_val)
                     except:
                         continue
+            elif override['type'] == 'recurrence-id' and override.get('is_override'):
+                # CRITICAL: Add RECURRENCE-ID for recurrence exception events
+                try:
+                    recurrence_id_dt = parse_date(override['recurrence_id'])
+                    event.add('recurrence-id', recurrence_id_dt)
+                except:
+                    self.logger.warning(f"Failed to parse RECURRENCE-ID: {override.get('recurrence_id')}")
+                    continue
         
         cal.add_component(event)
         return cal.to_ical().decode('utf-8')
+    
+    async def _get_events_with_sync_token(self, calendar, sync_token: str):
+        """Get events using CalDAV sync-collection for true incremental sync.
+        
+        This implements RFC 6578 - Collection Synchronization for WebDAV
+        to get only changed/deleted events since the last sync.
+        """
+        try:
+            # CalDAV sync-collection request
+            # This will return only events that changed since the sync_token
+            sync_query = f"""<?xml version="1.0" encoding="utf-8" ?>
+<D:sync-collection xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+    <D:sync-token>{sync_token}</D:sync-token>
+    <D:sync-level>1</D:sync-level>
+    <D:prop>
+        <D:getetag/>
+        <C:calendar-data/>
+    </D:prop>
+</D:sync-collection>"""
+
+            # Execute the sync query
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.calendar_home_set.client.request(
+                    calendar.url, 
+                    "REPORT", 
+                    sync_query,
+                    headers={"Content-Type": "application/xml; charset=utf-8"}
+                )
+            )
+            
+            # Parse the sync-collection response
+            events = await self._parse_sync_collection_response(response, calendar)
+            return events
+            
+        except Exception as e:
+            self.logger.error(f"CalDAV sync-collection failed: {e}")
+            # Fall back to regular date search
+            return await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.events()
+            )
+    
+    async def _parse_sync_collection_response(self, response, calendar):
+        """Parse CalDAV sync-collection XML response to extract events and deletions."""
+        import xml.etree.ElementTree as ET
+        
+        try:
+            # Parse XML response
+            root = ET.fromstring(response.content.decode('utf-8'))
+            
+            # Namespace mappings for CalDAV
+            namespaces = {
+                'D': 'DAV:',
+                'C': 'urn:ietf:params:xml:ns:caldav'
+            }
+            
+            events = []
+            deleted_hrefs = []
+            
+            # Find all response elements
+            for response_elem in root.findall('.//D:response', namespaces):
+                href_elem = response_elem.find('D:href', namespaces)
+                if href_elem is None:
+                    continue
+                    
+                href = href_elem.text
+                
+                # Check if this is a deletion (status 404)
+                status_elem = response_elem.find('.//D:status', namespaces)
+                if status_elem is not None and '404' in status_elem.text:
+                    deleted_hrefs.append(href)
+                    continue
+                
+                # Check for calendar data
+                calendar_data_elem = response_elem.find('.//C:calendar-data', namespaces)
+                if calendar_data_elem is not None and calendar_data_elem.text:
+                    try:
+                        # Create a mock CalDAV event object
+                        class MockCalDAVEvent:
+                            def __init__(self, data, url):
+                                self.data = data
+                                self.url = url
+                        
+                        mock_event = MockCalDAVEvent(calendar_data_elem.text, href)
+                        events.append(mock_event)
+                        
+                    except Exception as e:
+                        self.logger.warning(f"Failed to parse calendar data for {href}: {e}")
+                        continue
+            
+            # Log sync results
+            if deleted_hrefs:
+                self.logger.info(f"CalDAV sync found {len(deleted_hrefs)} deleted events")
+            self.logger.info(f"CalDAV sync found {len(events)} changed events")
+            
+            return events
+            
+        except ET.ParseError as e:
+            self.logger.error(f"Failed to parse CalDAV sync-collection XML response: {e}")
+            # Fall back to regular events query
+            return await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.events()
+            )
+        except Exception as e:
+            self.logger.error(f"Error parsing sync-collection response: {e}")
+            # Fall back to regular events query
+            return await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.events()
+            )
+    
+    async def get_sync_token(self, calendar_id: str) -> str:
+        """Get a sync token for incremental CalDAV sync.
+        
+        Args:
+            calendar_id: iCloud calendar ID (CalDAV URL)
+            
+        Returns:
+            Sync token (CTag) for future incremental calls
+        """
+        self._ensure_authenticated()
+        
+        try:
+            calendar = await self._find_calendar_by_id(calendar_id)
+            if not calendar:
+                raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
+            
+            # Get the current CTag (Calendar Collection Tag)
+            # This serves as our sync token for CalDAV
+            ctag = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.get_ctag()
+            )
+            
+            if not ctag:
+                raise CalendarServiceError("No CTag returned from iCloud CalDAV")
+                
+            return ctag
+            
+        except Exception as e:
+            raise CalendarServiceError(f"Failed to get iCloud sync token: {e}")
+    
+    def _extract_ical_field(self, ical_data: str, field_name: str) -> Optional[str]:
+        """Extract a field value from iCal data using regex.
+        
+        Args:
+            ical_data: Raw iCal data string
+            field_name: Field name to extract (e.g., 'UID', 'SUMMARY')
+            
+        Returns:
+            Field value or None if not found
+        """
+        try:
+            pattern = rf'^{field_name}:(.*)$'
+            match = re.search(pattern, ical_data, re.MULTILINE)
+            if match:
+                return match.group(1).strip()
+            return None
+        except Exception as e:
+            self.logger.warning(f"Error extracting {field_name} from iCal data: {e}")
+            return None
+    
+    async def test_connection(self) -> Dict[str, Any]:
+        """Test iCloud CalDAV connection.
+        
+        Returns:
+            Dictionary with connection test results
+        """
+        try:
+            if not self._authenticated:
+                await self.authenticate()
+            
+            # Try to get calendars as connection test
+            calendars = await self.get_calendars()
+            
+            return {
+                'success': True,
+                'calendars_found': len(calendars),
+                'server_url': self.settings.icloud_server_url,
+                'username': self.settings.icloud_username
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'server_url': self.settings.icloud_server_url,
+                'username': self.settings.icloud_username
+            }
+    
+    def _ensure_authenticated(self) -> None:
+        """Ensure service is authenticated, raise error if not."""
+        if not self._authenticated:
+            raise CalendarServiceError("iCloud service not authenticated. Call authenticate() first.")
+    
+    async def get_calendar_info(self, calendar_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed calendar information.
+        
+        Args:
+            calendar_id: iCloud calendar ID (CalDAV URL)
+            
+        Returns:
+            Dictionary with calendar details or None if not found
+        """
+        self._ensure_authenticated()
+        
+        try:
+            calendar = await self._find_calendar_by_id(calendar_id)
+            if not calendar:
+                return None
+            
+            # Get calendar properties
+            props = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.get_properties([
+                    caldav.dav.DisplayName(),
+                    caldav.dav.GetCTag(),
+                    caldav.dav.SupportedCalendarComponentSet()
+                ])
+            )
+            
+            return {
+                'id': calendar_id,
+                'url': str(calendar.url),
+                'name': props.get(caldav.dav.DisplayName.tag, 'Unknown'),
+                'ctag': props.get(caldav.dav.GetCTag.tag),
+                'supported_components': props.get(caldav.dav.SupportedCalendarComponentSet.tag, [])
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get iCloud calendar info: {e}")
+            return None

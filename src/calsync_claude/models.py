@@ -105,6 +105,54 @@ class CalendarEvent(BaseModel):
                 return False  # Don't sync, duplicate exists
         
         return True
+    
+    def is_recurrence_master(self) -> bool:
+        """Check if this is a master recurring event."""
+        return bool(self.recurrence_rule and not self.is_recurrence_override())
+    
+    def is_recurrence_override(self) -> bool:
+        """Check if this is a recurrence override/exception event."""
+        if self.recurrence_overrides:
+            for override in self.recurrence_overrides:
+                if override.get('type') == 'recurrence-id' and override.get('is_override'):
+                    return True
+        # Google Calendar specific check
+        return bool(hasattr(self, 'recurring_event_id') and getattr(self, 'recurring_event_id'))
+    
+    def get_recurrence_id(self) -> Optional[str]:
+        """Get the recurrence ID if this is an override event."""
+        if self.recurrence_overrides:
+            for override in self.recurrence_overrides:
+                if override.get('type') == 'recurrence-id':
+                    return override.get('recurrence_id')
+        return None
+    
+    def get_master_event_id(self) -> Optional[str]:
+        """Get the master event ID if this is an override."""
+        if self.recurrence_overrides:
+            for override in self.recurrence_overrides:
+                if override.get('type') == 'recurrence-id':
+                    return override.get('master_event_id')
+        # Google Calendar specific
+        if hasattr(self, 'recurring_event_id'):
+            return getattr(self, 'recurring_event_id')
+        return None
+    
+    def to_dict_for_comparison(self) -> Dict[str, Any]:
+        """Convert to dictionary for comparison (excluding volatile fields)."""
+        return {
+            'uid': self.uid,
+            'summary': self.summary,
+            'description': self.description,
+            'location': self.location,
+            'start': self.start.isoformat(),
+            'end': self.end.isoformat(),
+            'all_day': self.all_day,
+            'timezone': self.timezone,
+            'sequence': self.sequence,
+            'recurrence_rule': self.recurrence_rule,
+            'recurrence_overrides': self.recurrence_overrides
+        }
 
 
 class EventMapping(BaseModel):

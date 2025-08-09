@@ -406,36 +406,68 @@ class SyncEngine:
         processed_google = set()
         processed_icloud = set()
         
+        # CRITICAL: Group recurrence overrides with master events before syncing
+        google_events_grouped = self._group_recurrence_events(google_events)
+        icloud_events_grouped = self._group_recurrence_events(icloud_events)
+        
         # Check sync direction and perform appropriate syncs with UID-based deduplication
         if calendar_mapping.bidirectional or calendar_mapping.sync_direction == 'google_to_icloud':
-            # Process Google -> iCloud sync
-            for google_event in google_events.values():
-                if google_event.id in processed_google:
+            # Process Google -> iCloud sync with recurrence grouping
+            for group_id, group_data in google_events_grouped.items():
+                if group_id in processed_google:
                     continue
                 
-                # Check if event should be synced (UID-based deduplication)
-                if google_event.should_sync_to_calendar(icloud_calendar_id, icloud_events):
+                master_event = group_data['master']
+                override_events = group_data['overrides']
+                
+                # Sync master event first
+                if master_event.should_sync_to_calendar(icloud_calendar_id, icloud_events):
                     await self._sync_event_to_target(
-                        google_event, EventSource.ICLOUD, icloud_calendar_id,
+                        master_event, EventSource.ICLOUD, icloud_calendar_id,
                         calendar_mapping, mappings_by_google, sync_session, sync_report, dry_run,
                         target_events_by_uid=icloud_events_by_uid
                     )
-                processed_google.add(google_event.id)
+                processed_google.add(master_event.id)
+                
+                # Sync override events
+                for override_event in override_events:
+                    if override_event.id not in processed_google:
+                        if override_event.should_sync_to_calendar(icloud_calendar_id, icloud_events):
+                            await self._sync_event_to_target(
+                                override_event, EventSource.ICLOUD, icloud_calendar_id,
+                                calendar_mapping, mappings_by_google, sync_session, sync_report, dry_run,
+                                target_events_by_uid=icloud_events_by_uid
+                            )
+                        processed_google.add(override_event.id)
         
         if calendar_mapping.bidirectional or calendar_mapping.sync_direction == 'icloud_to_google':
-            # Process iCloud -> Google sync
-            for icloud_event in icloud_events.values():
-                if icloud_event.id in processed_icloud:
+            # Process iCloud -> Google sync with recurrence grouping
+            for group_id, group_data in icloud_events_grouped.items():
+                if group_id in processed_icloud:
                     continue
                 
-                # Check if event should be synced (UID-based deduplication)
-                if icloud_event.should_sync_to_calendar(google_calendar_id, google_events):
+                master_event = group_data['master']
+                override_events = group_data['overrides']
+                
+                # Sync master event first
+                if master_event.should_sync_to_calendar(google_calendar_id, google_events):
                     await self._sync_event_to_target(
-                        icloud_event, EventSource.GOOGLE, google_calendar_id,
+                        master_event, EventSource.GOOGLE, google_calendar_id,
                         calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run,
                         target_events_by_uid=google_events_by_uid
                     )
-                processed_icloud.add(icloud_event.id)
+                processed_icloud.add(master_event.id)
+                
+                # Sync override events
+                for override_event in override_events:
+                    if override_event.id not in processed_icloud:
+                        if override_event.should_sync_to_calendar(google_calendar_id, google_events):
+                            await self._sync_event_to_target(
+                                override_event, EventSource.GOOGLE, google_calendar_id,
+                                calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run,
+                                target_events_by_uid=google_events_by_uid
+                            )
+                        processed_icloud.add(override_event.id)
         
         # Handle deletions (events that exist in mapping but not in source)
         await self._handle_deletions(
@@ -926,3 +958,67 @@ class SyncEngine:
                 status['recent_sessions'].append(session_info)
             
             return status
+    
+    def _group_recurrence_events(self, events: Dict[str, CalendarEvent]) -> Dict[str, Dict[str, Any]]:
+        """Group recurrence override events with their master events.
+        
+        Args:
+            events: Dictionary of events by ID
+            
+        Returns:
+            Dictionary of grouped events with master and overrides
+        """
+        grouped = {}
+        master_events = {}
+        override_events = []
+        
+        # First pass: identify master events and overrides
+        for event in events.values():
+            is_recurrence_override = False
+            
+            # Check if this is a recurrence override event
+            if event.recurrence_overrides:
+                for override in event.recurrence_overrides:
+                    if override.get('type') == 'recurrence-id' and override.get('is_override'):
+                        is_recurrence_override = True
+                        break
+            
+            # Google Calendar specific: recurringEventId indicates override
+            if hasattr(event, 'recurring_event_id') and event.recurring_event_id:
+                is_recurrence_override = True
+                
+            if is_recurrence_override:
+                override_events.append(event)
+            else:
+                # This is a master event or standalone event
+                grouped[event.id] = {
+                    'master': event,
+                    'overrides': []
+                }
+                if event.uid:
+                    master_events[event.uid] = event.id
+        
+        # Second pass: link overrides to their masters
+        for override_event in override_events:
+            master_id = None
+            
+            # Try to find master by Google's recurringEventId
+            if hasattr(override_event, 'recurring_event_id') and override_event.recurring_event_id:
+                if override_event.recurring_event_id in grouped:
+                    master_id = override_event.recurring_event_id
+            
+            # Try to find master by UID (iCloud/iCal standard)
+            if not master_id and override_event.uid and override_event.uid in master_events:
+                master_id = master_events[override_event.uid]
+            
+            if master_id and master_id in grouped:
+                grouped[master_id]['overrides'].append(override_event)
+            else:
+                # Orphaned override - treat as standalone event
+                self.logger.warning(f"Orphaned recurrence override event: {override_event.id}")
+                grouped[override_event.id] = {
+                    'master': override_event,
+                    'overrides': []
+                }
+        
+        return grouped
