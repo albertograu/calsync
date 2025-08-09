@@ -201,6 +201,105 @@ class iCloudCalendarService(BaseCalendarService):
         max_results: Optional[int] = None,
         updated_min: Optional[datetime] = None,
         sync_token: Optional[str] = None,
+    ) -> ChangeSet[CalendarEvent]:
+        """Return changed events and explicit deletions using CalDAV sync-collection when possible."""
+        self._ensure_authenticated()
+
+        # Defaults for initial backfill
+        if time_min is None:
+            time_min = datetime.now(pytz.UTC) - timedelta(days=self.settings.sync_config.sync_past_days)
+        if time_max is None:
+            time_max = datetime.now(pytz.UTC) + timedelta(days=self.settings.sync_config.sync_future_days)
+
+        try:
+            calendar = await self._find_calendar_by_id(calendar_id)
+            if not calendar:
+                raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
+
+            changed: Dict[str, CalendarEvent] = {}
+            deleted_native_ids: set[str] = set()
+            next_token: Optional[str] = None
+            used_sync = bool(sync_token)
+
+            if sync_token:
+                # Use sync-collection REPORT to get deltas
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.calendar_home_set.client.request(
+                        calendar.url,
+                        "REPORT",
+                        f"""<?xml version=\"1.0\" encoding=\"utf-8\" ?>
+<D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
+  <D:sync-token>{sync_token}</D:sync-token>
+  <D:sync-level>1</D:sync-level>
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+</D:sync-collection>""",
+                        headers={"Content-Type": "application/xml; charset=utf-8"}
+                    )
+                )
+
+                # Parse for changes and deletions
+                events, deleted_hrefs, extracted_next = await self._parse_sync_collection_for_changes(response, calendar)
+                next_token = extracted_next
+
+                # Turn events into CalendarEvent and key by href
+                for ev in events:
+                    parsed = self._parse_caldav_event(ev)
+                    if parsed:
+                        native_id = str(ev.url)
+                        changed[native_id] = parsed
+                for href in deleted_hrefs:
+                    deleted_native_ids.add(href)
+            else:
+                # Fallback: time range snapshot
+                events = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.date_search(start=time_min, end=time_max)
+                )
+                count = 0
+                for ev in events:
+                    if max_results and count >= max_results:
+                        break
+                    parsed = self._parse_caldav_event(ev)
+                    if parsed:
+                        if updated_min and parsed.updated < updated_min:
+                            continue
+                        native_id = str(ev.url) if hasattr(ev, 'url') else parsed.id
+                        changed[native_id] = parsed
+                        count += 1
+                # Try to get a token for next run
+                try:
+                    next_token = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: calendar.get_ctag()
+                    )
+                except Exception:
+                    next_token = None
+
+            return ChangeSet[CalendarEvent](
+                changed=changed,
+                deleted_native_ids=deleted_native_ids,
+                next_sync_token=next_token,
+                used_sync_token=used_sync,
+            )
+        except Exception as e:
+            if "401" in str(e) or "unauthor" in str(e).lower():
+                raise AuthenticationError("iCloud authentication failed. Ensure an app-specific password is set.")
+            if "429" in str(e) or "throttl" in str(e).lower():
+                raise CalendarServiceError(f"iCloud throttled: {e}")
+            raise CalendarServiceError(f"Failed to get iCloud change set: {e}")
+
+    async def get_change_set(
+        self,
+        calendar_id: str,
+        time_min: Optional[datetime] = None,
+        time_max: Optional[datetime] = None,
+        max_results: Optional[int] = None,
+        updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
     ) -> ChangeSet:
         """Return changed events and explicit deletions using CalDAV sync-collection when possible."""
         self._ensure_authenticated()
@@ -425,6 +524,63 @@ class iCloudCalendarService(BaseCalendarService):
             raise
         except Exception as e:
             raise CalendarServiceError(f"Failed to delete iCloud event: {e}")
+
+    async def delete_resource_by_href(self, calendar_id: str, href: str) -> None:
+        """Delete a CalDAV resource directly by its href."""
+        self._ensure_authenticated()
+        try:
+            calendar = await self._find_calendar_by_id(calendar_id)
+            if not calendar:
+                raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.calendar_home_set.client.request(href, "DELETE")
+            )
+        except Exception as e:
+            raise CalendarServiceError(f"Failed to delete iCloud resource {href}: {e}")
+
+    async def add_exdate_to_resource(self, calendar_id: str, href: str, recurrence_id_iso: str, all_day: bool = False) -> None:
+        """Fetch the ICS at href, add EXDATE for the given recurrence, and save back."""
+        self._ensure_authenticated()
+        try:
+            calendar = await self._find_calendar_by_id(calendar_id)
+            if not calendar:
+                raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
+            # Find the event by href
+            events = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.events()
+            )
+            target = None
+            for ev in events:
+                if str(ev.url) == href:
+                    target = ev
+                    break
+            if not target:
+                raise EventNotFoundError(f"Resource {href} not found")
+            # Parse and add EXDATE
+            cal = Calendar.from_ical(target.data)
+            vevent = next((c for c in cal.walk() if c.name == 'VEVENT'), None)
+            if not vevent:
+                raise CalendarServiceError("Invalid ICS: missing VEVENT")
+            from dateutil.parser import isoparse
+            rid = isoparse(recurrence_id_iso)
+            if all_day:
+                rid = rid.date()
+            vevent.add('exdate', rid)
+            # Increment SEQUENCE if present
+            try:
+                seq = int(vevent.get('sequence', 0)) + 1
+                vevent['sequence'] = seq
+            except Exception:
+                pass
+            updated_ics = cal.to_ical().decode('utf-8')
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: setattr(target, 'data', updated_ics) or target.save()
+            )
+        except Exception as e:
+            raise CalendarServiceError(f"Failed to add EXDATE to {href}: {e}")
     
     async def _find_calendar_by_id(self, calendar_id: str):
         """Find calendar object by ID."""

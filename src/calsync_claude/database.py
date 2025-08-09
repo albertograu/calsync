@@ -118,6 +118,9 @@ class EventMappingDB(Base):
     google_sequence = Column(Integer, nullable=True, default=0)       # Google sequence number
     icloud_sequence = Column(Integer, nullable=True, default=0)       # iCloud sequence number
     
+    # Recurrence instance tracking
+    recurrence_id = Column(String(64), nullable=True, index=True)     # ISO timestamp identifying an instance
+
     # Content tracking
     content_hash = Column(String(64), nullable=False, index=True)
     
@@ -125,6 +128,8 @@ class EventMappingDB(Base):
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
     updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
     last_sync_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_side = Column(String(16), nullable=True)  # 'google' or 'icloud'
     
     # Sync metadata
     sync_direction = Column(String(20), nullable=True)  # 'google_to_icloud', 'icloud_to_google'
@@ -155,6 +160,7 @@ class EventMappingDB(Base):
         # Status and content indexes
         Index('idx_event_mapping_sync_status', 'sync_status'),
         Index('idx_event_mapping_content_hash', 'content_hash'),
+        Index('idx_event_mapping_recurrence', 'recurrence_id'),
         Index('idx_event_mapping_last_sync', 'last_sync_at'),
         
         # Composite indexes for common queries

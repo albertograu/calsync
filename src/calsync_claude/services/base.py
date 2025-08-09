@@ -115,6 +115,18 @@ class BaseCalendarService(ABC):
         pass
 
     @abstractmethod
+    async def get_changes(
+        self,
+        calendar_id: str,
+        *,
+        sync_token: Optional[str] = None,
+        time_min: Optional[datetime] = None,
+        time_max: Optional[datetime] = None,
+    ) -> ChangeSet[CalendarEvent]:
+        """Return deltas since sync_token if provided, else a time window snapshot with used_sync_token=False."""
+        pass
+
+    # Backward-compat wrapper used internally
     async def get_change_set(
         self,
         calendar_id: str,
@@ -123,21 +135,13 @@ class BaseCalendarService(ABC):
         max_results: Optional[int] = None,
         updated_min: Optional[datetime] = None,
         sync_token: Optional[str] = None,
-    ) -> ChangeSet:
-        """Get an incremental change set from a calendar.
-        
-        Args:
-            calendar_id: Calendar ID
-            time_min: Optional start time for initial backfill
-            time_max: Optional end time for initial backfill
-            max_results: Optional cap
-            updated_min: Optional filter for initial backfill
-            sync_token: If present, do a true incremental sync returning only changes and deletions
-        
-        Returns:
-            ChangeSet containing changed events, deleted IDs, and next sync token when available
-        """
-        pass
+    ) -> ChangeSet[CalendarEvent]:
+        return await self.get_changes(
+            calendar_id,
+            sync_token=sync_token,
+            time_min=time_min,
+            time_max=time_max,
+        )
     
     @abstractmethod
     async def create_event(

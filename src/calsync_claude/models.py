@@ -2,7 +2,8 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional, List, Set
+from typing import Any, Dict, Optional, List, Set, TypeVar, Generic
+from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, validator
@@ -337,13 +338,11 @@ class SyncConfiguration(BaseModel):
         return bool(self.calendar_pairs)
 
 
-class ChangeSet(BaseModel):
-    """Represents an incremental change set from a calendar source.
-    
-    - changed: map of event_id -> CalendarEvent for created/updated events
-    - deleted_ids: set of event_ids that were deleted on the source
-    - next_sync_token: token to use for next incremental sync, if provided
-    """
-    changed: Dict[str, CalendarEvent] = Field(default_factory=dict)
-    deleted_ids: Set[str] = Field(default_factory=set)
-    next_sync_token: Optional[str] = None
+T = TypeVar('T')
+
+@dataclass
+class ChangeSet(Generic[T]):
+    changed: Dict[str, T]
+    deleted_native_ids: Set[str]
+    next_sync_token: Optional[str]
+    used_sync_token: bool

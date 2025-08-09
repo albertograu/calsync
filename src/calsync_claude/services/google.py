@@ -258,6 +258,9 @@ class GoogleCalendarService(BaseCalendarService):
         except Exception as e:
             raise CalendarServiceError(f"Failed to get Google events: {e}")
 
+    class TokenInvalid(Exception):
+        pass
+
     async def get_change_set(
         self,
         calendar_id: str,
@@ -266,8 +269,12 @@ class GoogleCalendarService(BaseCalendarService):
         max_results: Optional[int] = None,
         updated_min: Optional[datetime] = None,
         sync_token: Optional[str] = None,
-    ) -> ChangeSet:
-        """Return changed events and explicit deletions. Handles Google 410 token reset."""
+    ) -> ChangeSet[CalendarEvent]:
+        """Return changed events and explicit deletions.
+        - If sync_token is provided, use true incremental with showDeleted.
+        - If token invalid (410), raise TokenInvalid.
+        - If no token, use time window and return snapshot (no deletions).
+        """
         self._ensure_authenticated()
         changed: Dict[str, CalendarEvent] = {}
         deleted_ids: set[str] = set()
@@ -299,9 +306,14 @@ class GoogleCalendarService(BaseCalendarService):
                 params['pageToken'] = page_token
             return params
 
+        used_sync = bool(sync_token)
         try:
             while True:
                 params = _build_params()
+                if sync_token:
+                    params['showDeleted'] = True
+                    params['singleEvents'] = True
+                    params['maxResults'] = min(2500, max_results or 2500)
                 try:
                     events_result = await asyncio.get_event_loop().run_in_executor(
                         None,
@@ -312,9 +324,8 @@ class GoogleCalendarService(BaseCalendarService):
                         self.logger.warning("Google API rate limited, retrying...")
                         raise CalendarServiceError(f"Rate limited: {e}")
                     if e.resp.status == 410 and sync_token:
-                        # Invalid/expired token
-                        self.logger.warning("Google sync token expired/invalid (410).")
-                        raise CalendarServiceError("SYNC_TOKEN_INVALID")
+                        self.logger.warning("Google sync token expired/invalid (410)")
+                        raise GoogleCalendarService.TokenInvalid()
                     raise
 
                 for event_data in events_result.get('items', []):
@@ -336,15 +347,21 @@ class GoogleCalendarService(BaseCalendarService):
                 if not page_token:
                     break
 
-            # Expose token via callback for legacy callers
             if next_sync_token and hasattr(self, '_current_sync_token_callback'):
                 self._current_sync_token_callback(next_sync_token)
 
-            return ChangeSet(changed=changed, deleted_ids=deleted_ids, next_sync_token=next_sync_token)
+            return ChangeSet[CalendarEvent](
+                changed=changed,
+                deleted_native_ids=deleted_ids,
+                next_sync_token=next_sync_token,
+                used_sync_token=used_sync,
+            )
         except HttpError as e:
             if e.resp.status == 404:
                 raise CalendarServiceError(f"Google calendar {calendar_id} not found")
             raise CalendarServiceError(f"Failed to get Google change set: {e}")
+        except GoogleCalendarService.TokenInvalid:
+            raise
         except Exception as e:
             raise CalendarServiceError(f"Failed to get Google change set: {e}")
     
@@ -448,6 +465,47 @@ class GoogleCalendarService(BaseCalendarService):
             raise CalendarServiceError(f"Failed to delete Google event: {e}")
         except Exception as e:
             raise CalendarServiceError(f"Failed to delete Google event: {e}")
+
+    async def find_instance_id(
+        self,
+        calendar_id: str,
+        recurring_event_id: str,
+        recurrence_id_iso: str
+    ) -> Optional[str]:
+        """Find a Google instance eventId by querying instances around the recurrence_id timestamp."""
+        self._ensure_authenticated()
+        try:
+            # Use a tight window around the recurrence_id
+            from dateutil.parser import isoparse
+            rid = isoparse(recurrence_id_iso)
+            time_min = (rid - timedelta(minutes=5)).isoformat()
+            time_max = (rid + timedelta(minutes=5)).isoformat()
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().instances(
+                    calendarId=calendar_id,
+                    eventId=recurring_event_id,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    maxResults=50
+                ).execute()
+            )
+            for item in result.get('items', []):
+                # Match on originalStartTime if present
+                ost = item.get('originalStartTime', {}).get('dateTime') or item.get('originalStartTime', {}).get('date')
+                if ost:
+                    try:
+                        if isoparse(ost) == rid:
+                            return item.get('id')
+                    except Exception:
+                        continue
+            return None
+        except HttpError as e:
+            if e.resp.status == 404:
+                return None
+            raise CalendarServiceError(f"Failed to query instances: {e}")
+        except Exception as e:
+            raise CalendarServiceError(f"Failed to query instances: {e}")
     
     def _format_google_event(self, event_data: Dict[str, Any]) -> CalendarEvent:
         """Convert Google Calendar event to standard format."""

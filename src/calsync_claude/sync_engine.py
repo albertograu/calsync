@@ -351,7 +351,7 @@ class SyncEngine:
 
         # Fetch Google change set, handle 410 token invalidation
         try:
-            g_cs: ChangeSet = await self.google_service.get_change_set(
+            g_cs: ChangeSet[CalendarEvent] = await self.google_service.get_change_set(
                 google_calendar_id,
                 time_min=None if google_sync_token else time_min,
                 time_max=None if google_sync_token else time_max,
@@ -359,8 +359,7 @@ class SyncEngine:
                 updated_min=None if google_sync_token else last_sync_time,
                 sync_token=google_sync_token
             )
-        except CalendarServiceError as e:
-            if str(e) == "SYNC_TOKEN_INVALID":
+        except GoogleCalendarService.TokenInvalid:
                 # Clear token and perform one-time backfill to mint a new token; do NOT process deletions from Google this run
                 self.logger.warning("Resetting Google sync token and performing backfill to mint a new token")
                 with self.db_manager.get_session() as session:
@@ -376,19 +375,17 @@ class SyncEngine:
                     sync_token=None
                 )
                 # Ignore deletions during backfill
-                g_cs.deleted_ids = set()
-            else:
-                raise
+                g_cs.deleted_native_ids = set()
 
         google_events = dict(g_cs.changed)
-        google_deleted_ids = set(g_cs.deleted_ids)
+        google_deleted_ids = set(g_cs.deleted_native_ids)
         new_google_sync_token = g_cs.next_sync_token
         for ev in google_events.values():
             if ev.uid:
                 google_events_by_uid[ev.uid] = ev
 
         # Fetch iCloud change set
-        i_cs: ChangeSet = await self.icloud_service.get_change_set(
+        i_cs: ChangeSet[CalendarEvent] = await self.icloud_service.get_change_set(
             icloud_calendar_id,
             time_min=None if icloud_sync_token else time_min,
             time_max=None if icloud_sync_token else time_max,
@@ -397,7 +394,7 @@ class SyncEngine:
             sync_token=icloud_sync_token
         )
         icloud_events = dict(i_cs.changed)
-        icloud_deleted_raw = set(i_cs.deleted_ids)
+        icloud_deleted_raw = set(i_cs.deleted_native_ids)
         new_icloud_sync_token = i_cs.next_sync_token
         for ev in icloud_events.values():
             if ev.uid:
@@ -524,9 +521,11 @@ class SyncEngine:
                     f"Unmapped iCloud deleted hrefs: {len(unmatched)}"
                 )
 
-        # Handle deletions using explicit deleted_id sets
+        # Handle deletions using explicit deleted_id sets, only if used_sync_token on that side
         await self._handle_deletions(
-            google_deleted_ids, icloud_deleted_ids, existing_mappings,
+            google_deleted_ids if g_cs.used_sync_token else set(),
+            icloud_deleted_ids if i_cs.used_sync_token else set(),
+            existing_mappings,
             google_calendar_id, icloud_calendar_id, calendar_mapping,
             sync_session, sync_report, dry_run
         )
