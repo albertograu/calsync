@@ -3,7 +3,7 @@
 import asyncio
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, AsyncIterator
+from typing import Any, Dict, List, Optional, AsyncIterator, Set
 from urllib.parse import urljoin
 
 import caldav
