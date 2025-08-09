@@ -369,6 +369,21 @@ class GoogleCalendarService(BaseCalendarService):
         except Exception as e:
             raise CalendarServiceError(f"Failed to get Google change set: {e}")
     
+    async def get_changes(
+        self,
+        calendar_id: str,
+        *,
+        updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
+    ) -> ChangeSet[CalendarEvent]:
+        """Get changes from Google Calendar - delegates to get_change_set."""
+        return await self.get_change_set(
+            calendar_id=calendar_id,
+            time_min=updated_min,
+            sync_token=sync_token,
+            updated_min=updated_min
+        )
+    
     async def get_event(self, calendar_id: str, event_id: str) -> CalendarEvent:
         """Get a specific Google Calendar event."""
         self._ensure_authenticated()

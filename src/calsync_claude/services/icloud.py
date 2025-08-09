@@ -291,6 +291,21 @@ class iCloudCalendarService(BaseCalendarService):
             if "429" in str(e) or "throttl" in str(e).lower():
                 raise CalendarServiceError(f"iCloud throttled: {e}")
             raise CalendarServiceError(f"Failed to get iCloud change set: {e}")
+    
+    async def get_changes(
+        self,
+        calendar_id: str,
+        *,
+        updated_min: Optional[datetime] = None,
+        sync_token: Optional[str] = None,
+    ) -> ChangeSet[CalendarEvent]:
+        """Get changes from iCloud Calendar - delegates to get_change_set."""
+        return await self.get_change_set(
+            calendar_id=calendar_id,
+            time_min=updated_min,
+            sync_token=sync_token,
+            updated_min=updated_min
+        )
 
     
     async def get_event(self, calendar_id: str, event_id: str) -> CalendarEvent:
