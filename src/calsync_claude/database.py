@@ -1,7 +1,7 @@
 """Database models and operations for sync state management."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import create_engine, Column, String, DateTime, Boolean, Text, Integer, ForeignKey, Index, UniqueConstraint
