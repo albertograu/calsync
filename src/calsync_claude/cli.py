@@ -42,28 +42,17 @@ def setup_logging(level: str, debug: bool = False) -> None:
     )
 
 
-class AsyncGroup(click.Group):
-    """Click group that supports async commands."""
-    
-    def invoke(self, ctx):
-        """Invoke the command, handling async commands."""
-        if asyncio.iscoroutinefunction(ctx.command.callback):
-            return asyncio.run(ctx.command.callback(ctx, **ctx.params))
-        return super().invoke(ctx)
+def async_command(f):
+    """Decorator to wrap async click commands."""
+    @click.pass_context
+    def wrapper(ctx, *args, **kwargs):
+        return asyncio.run(f(ctx, *args, **kwargs))
+    wrapper.__name__ = f.__name__
+    wrapper.__doc__ = f.__doc__
+    return wrapper
 
 
-def async_command(*args, **kwargs):
-    """Decorator for async click commands."""
-    def decorator(f):
-        @click.command(*args, **kwargs)
-        @click.pass_context
-        def wrapper(ctx, *args, **kwargs):
-            return asyncio.run(f(ctx, *args, **kwargs))
-        return wrapper
-    return decorator
-
-
-@click.group(cls=AsyncGroup)
+@click.group()
 @click.version_option(version="2.0.0")
 @click.option('--config', '-c', type=click.Path(exists=True), 
               help='Path to configuration file')
@@ -105,7 +94,7 @@ def cli(ctx, config, debug, verbose):
 @click.option('--conflict-resolution', '-r',
               type=click.Choice(['manual', 'latest_wins', 'google_wins', 'icloud_wins']),
               help='Conflict resolution strategy')
-@click.pass_context
+@async_command
 async def sync(ctx, dry_run, conflict_resolution):
     """Synchronize calendars between Google and iCloud."""
     settings = ctx.obj['settings']
@@ -186,7 +175,7 @@ async def sync(ctx, dry_run, conflict_resolution):
 
 
 @cli.command()
-@click.pass_context
+@async_command
 async def status(ctx):
     """Show sync status and recent activity."""
     settings = ctx.obj['settings']
@@ -219,7 +208,7 @@ async def status(ctx):
 
 
 @cli.command()
-@click.pass_context
+@async_command
 async def test(ctx):
     """Test calendar connections and display sample events."""
     settings = ctx.obj['settings']
@@ -273,7 +262,7 @@ async def test(ctx):
               help='Run in dry-run mode')
 @click.option('--max-runs', type=int,
               help='Maximum number of sync runs (default: infinite)')
-@click.pass_context
+@async_command
 async def daemon(ctx, interval, dry_run, max_runs):
     """Run CalSync continuously as a daemon."""
     settings = ctx.obj['settings']
@@ -411,7 +400,7 @@ def calendars():
 
 
 @calendars.command('list')
-@click.pass_context
+@async_command
 async def list_calendars(ctx):
     """List all available calendars from both services."""
     settings = ctx.obj['settings']
@@ -468,7 +457,7 @@ async def list_calendars(ctx):
 
 
 @calendars.command('mappings')
-@click.pass_context
+@async_command
 async def show_mappings(ctx):
     """Show current calendar mappings."""
     settings = ctx.obj['settings']
@@ -662,7 +651,7 @@ async def auto_map_calendars(ctx, dry_run):
 
 
 @cli.command()
-@click.pass_context
+@async_command
 async def conflicts(ctx):
     """Show and resolve conflicts."""
     settings = ctx.obj['settings']
