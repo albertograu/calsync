@@ -483,7 +483,11 @@ class CalendarManager:
             List of all calendar mappings
         """
         with self.db_manager.get_session() as session:
-            return self.db_manager.get_calendar_mappings(session)
+            mappings = self.db_manager.get_calendar_mappings(session)
+            # Expunge all objects from session so they can be used outside the session
+            for mapping in mappings:
+                session.expunge(mapping)
+            return mappings
     
     async def update_mapping(
         self,
@@ -507,7 +511,10 @@ class CalendarManager:
             if not mapping:
                 return None
             
-            return self.db_manager.update_calendar_mapping(session, mapping, **kwargs)
+            updated_mapping = self.db_manager.update_calendar_mapping(session, mapping, **kwargs)
+            if updated_mapping:
+                session.expunge(updated_mapping)
+            return updated_mapping
     
     async def delete_mapping(self, mapping_id: str) -> bool:
         """Delete a calendar mapping.
