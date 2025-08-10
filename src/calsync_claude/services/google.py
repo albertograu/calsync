@@ -59,7 +59,17 @@ class GoogleCalendarService(BaseCalendarService):
                         str(self.settings.google_credentials_path),
                         self.settings.google_scopes
                     )
-                    creds = flow.run_local_server(port=0)
+                    # Use console-based authentication for headless servers
+                    try:
+                        creds = flow.run_console()
+                    except Exception as console_error:
+                        self.logger.error(f"Console authentication failed: {console_error}")
+                        # Fallback: provide manual instructions
+                        raise AuthenticationError(
+                            f"Google OAuth requires manual setup for headless deployment. "
+                            f"Run 'calsync-claude auth setup' on a machine with a browser, "
+                            f"then copy the token file to this server. Error: {console_error}"
+                        )
                 
                 # Save credentials for next run with secure permissions
                 token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
