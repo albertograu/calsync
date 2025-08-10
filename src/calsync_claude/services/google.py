@@ -59,16 +59,33 @@ class GoogleCalendarService(BaseCalendarService):
                         str(self.settings.google_credentials_path),
                         self.settings.google_scopes
                     )
-                    # Use console-based authentication for headless servers
-                    try:
-                        creds = flow.run_console()
-                    except Exception as console_error:
-                        self.logger.error(f"Console authentication failed: {console_error}")
-                        # Fallback: provide manual instructions
+                    # Use out-of-band (OOB) flow for headless servers
+                    auth_url, _ = flow.authorization_url(prompt='consent')
+                    
+                    self.logger.error(
+                        f"\n{'='*60}\n"
+                        f"GOOGLE OAUTH SETUP REQUIRED\n"
+                        f"{'='*60}\n"
+                        f"1. Open this URL in your browser:\n"
+                        f"   {auth_url}\n\n"
+                        f"2. Grant permissions and copy the authorization code\n\n"
+                        f"3. Set the code as environment variable:\n"
+                        f"   docker compose -f docker-compose.secrets.yml exec calsync \\\n"
+                        f"   /bin/bash -c 'export GOOGLE_AUTH_CODE=your_code_here && calsync-claude sync --dry-run'\n\n"
+                        f"Or copy a pre-generated token file to ./data/credentials/google_token.json\n"
+                        f"{'='*60}"
+                    )
+                    
+                    # Check for authorization code in environment
+                    import os
+                    auth_code = os.environ.get('GOOGLE_AUTH_CODE')
+                    if auth_code:
+                        flow.fetch_token(code=auth_code)
+                        creds = flow.credentials
+                        self.logger.info("Successfully authenticated using authorization code")
+                    else:
                         raise AuthenticationError(
-                            f"Google OAuth requires manual setup for headless deployment. "
-                            f"Run 'calsync-claude auth setup' on a machine with a browser, "
-                            f"then copy the token file to this server. Error: {console_error}"
+                            f"Google OAuth setup required. See logs above for instructions."
                         )
                 
                 # Save credentials for next run with secure permissions
