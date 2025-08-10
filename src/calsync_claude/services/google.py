@@ -723,20 +723,14 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
-            # CRITICAL FIX: Google Calendar API requires time bounds to return nextSyncToken
-            # Must use a specific time window for the initial sync token acquisition
-            from datetime import datetime, timedelta
-            import pytz
-            
-            now = datetime.now(pytz.UTC)
-            time_min = now - timedelta(days=365)  # Look back 1 year for comprehensive token
-            time_max = now + timedelta(days=365)  # Look ahead 1 year
+            # FIXED: Google Calendar API sync token acquisition
+            # The sync token is returned when using the events.list API WITHOUT time bounds
+            # After getting the full list, the nextSyncToken allows incremental updates
             
             page_token = None
             sync_token = None
             
-            self.logger.info(f"📊 Google API: Acquiring sync token with time bounds")
-            self.logger.info(f"  📅 Time range: {time_min.isoformat()} to {time_max.isoformat()}")
+            self.logger.info(f"📊 Google API: Acquiring sync token without time bounds")
             page_count = 0
             total_events = 0
             
@@ -746,9 +740,7 @@ class GoogleCalendarService(BaseCalendarService):
                     'calendarId': calendar_id,
                     'maxResults': 250,  # Max per page
                     'singleEvents': True,
-                    'orderBy': 'startTime',
-                    'timeMin': time_min.isoformat(),
-                    'timeMax': time_max.isoformat()
+                    'showDeleted': True,  # Required for sync tokens
                 }
                 if page_token:
                     params['pageToken'] = page_token
@@ -766,7 +758,7 @@ class GoogleCalendarService(BaseCalendarService):
                     self.logger.error(f"❌ Google API: Request failed: {type(e).__name__}: {e}")
                     raise
                 
-                # Log full response keys for debugging
+                # Log response info
                 result_keys = list(result.keys()) if result else []
                 self.logger.info(f"🔍 Google API: Response keys: {result_keys}")
                 
@@ -779,21 +771,6 @@ class GoogleCalendarService(BaseCalendarService):
                 sync_token_on_page = result.get('nextSyncToken')
                 
                 self.logger.info(f"🔄 Google API: Page {page_count} - nextPageToken: {'✅' if page_token else '❌'} | nextSyncToken: {'✅' if sync_token_on_page else '❌'}")
-                
-                # Debug: Log raw sync token value if present
-                if sync_token_on_page:
-                    self.logger.info(f"🔑 Google API: Raw nextSyncToken value: {repr(sync_token_on_page)}")
-                else:
-                    self.logger.warning(f"⚠️  Google API: nextSyncToken is None/missing in response")
-                
-                # Debug: Check if this is really the final page
-                if not page_token:
-                    self.logger.info(f"🏁 Google API: This is the final page (no nextPageToken)")
-                    if not sync_token_on_page:
-                        self.logger.error(f"💥 Google API: CRITICAL - Final page has no nextSyncToken!")
-                        self.logger.error(f"🔍 Google API: Full response dump: {result}")
-                else:
-                    self.logger.info(f"➡️  Google API: More pages available (has nextPageToken)")
                 
                 # Sync token is only available on the final page
                 if not page_token:

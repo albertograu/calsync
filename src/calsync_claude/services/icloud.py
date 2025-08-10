@@ -280,9 +280,9 @@ class iCloudCalendarService(BaseCalendarService):
                 try:
                     props = await asyncio.get_event_loop().run_in_executor(
                         None,
-                        lambda: calendar.get_properties([caldav.dav.GetCtag()])
+                        lambda: calendar.get_properties([caldav.dav.GetEtag()])
                     )
-                    next_token = props.get(caldav.dav.GetCtag.tag)
+                    next_token = props.get(caldav.dav.GetEtag.tag)
                 except Exception:
                     next_token = None
 
@@ -923,51 +923,26 @@ class iCloudCalendarService(BaseCalendarService):
             # This serves as our sync token for CalDAV
             self.logger.info(f"📊 iCloud CalDAV: Requesting calendar properties (CTag)")
             
-            # CRITICAL FIX: Use correct CalDAV import - GetCtag not GetCTag
-            self.logger.info(f"🔧 iCloud CalDAV: Attempting to import GetCtag class...")
+            # FIXED: Use correct CalDAV property - GetEtag is the correct class
+            self.logger.info(f"🔧 iCloud CalDAV: Using GetEtag for calendar change detection...")
             
-            # Debug: Test CalDAV imports
+            # The CalDAV library uses GetEtag, not GetCtag
             try:
-                self.logger.info(f"🔍 iCloud CalDAV: caldav module: {caldav}")
-                self.logger.info(f"🔍 iCloud CalDAV: caldav.dav module: {caldav.dav}")
-                
-                # List available attributes in caldav.dav
-                dav_attrs = [attr for attr in dir(caldav.dav) if 'tag' in attr.lower() or 'ctag' in attr.lower()]
-                self.logger.info(f"🔍 iCloud CalDAV: caldav.dav CTag-related attributes: {dav_attrs}")
-                
-                # Try different possible CTag class names
-                possible_ctag_classes = []
-                for attr_name in ['GetCtag', 'GetCTag', 'Ctag', 'CTag', 'GetETag', 'ETag']:
-                    if hasattr(caldav.dav, attr_name):
-                        possible_ctag_classes.append(attr_name)
-                self.logger.info(f"🔍 iCloud CalDAV: Available CTag classes: {possible_ctag_classes}")
-                
-                # Try to access GetCtag specifically
-                try:
-                    ctag_class = caldav.dav.GetCtag
-                    self.logger.info(f"✅ iCloud CalDAV: GetCtag class found: {ctag_class}")
-                    ctag_instance = ctag_class()
-                    self.logger.info(f"✅ iCloud CalDAV: GetCtag instance created: {ctag_instance}")
-                    if hasattr(ctag_instance, 'tag'):
-                        self.logger.info(f"🏷️  iCloud CalDAV: GetCtag.tag = {ctag_instance.tag}")
-                except AttributeError as e:
-                    self.logger.error(f"❌ iCloud CalDAV: GetCtag class not found: {e}")
-                    
-                    # Try alternative approaches
-                    all_dav_attrs = [attr for attr in dir(caldav.dav) if not attr.startswith('_')]
-                    self.logger.error(f"🔍 iCloud CalDAV: All caldav.dav attributes: {all_dav_attrs[:20]}...")
-                    raise
+                # Verify GetEtag exists
+                if not hasattr(caldav.dav, 'GetEtag'):
+                    raise CalendarServiceError("CalDAV library missing GetEtag class")
+                self.logger.info(f"✅ iCloud CalDAV: GetEtag class found")
                     
             except Exception as import_error:
-                self.logger.error(f"💥 iCloud CalDAV: CalDAV import debugging failed: {type(import_error).__name__}: {import_error}")
-                raise
+                self.logger.error(f"💥 iCloud CalDAV: CalDAV import failed: {type(import_error).__name__}: {import_error}")
+                raise CalendarServiceError(f"CalDAV library issue: {import_error}")
             
-            # Proceed with property request
+            # Proceed with property request using GetEtag
             self.logger.info(f"🔧 iCloud CalDAV: Making properties request...")
             try:
                 props = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: calendar.get_properties([caldav.dav.GetCtag()])
+                    lambda: calendar.get_properties([caldav.dav.GetEtag()])
                 )
                 self.logger.info(f"✅ iCloud CalDAV: Properties request successful")
             except Exception as props_error:
@@ -978,19 +953,19 @@ class iCloudCalendarService(BaseCalendarService):
             self.logger.info(f"🔍 iCloud CalDAV: Properties type: {type(props)}")
             self.logger.info(f"🔍 iCloud CalDAV: Available properties: {list(props.keys()) if props else 'None'}")
             
-            # Debug property access
+            # Get ETag as sync token
             try:
-                ctag_tag = caldav.dav.GetCtag.tag
-                self.logger.info(f"🏷️  iCloud CalDAV: GetCtag.tag = {repr(ctag_tag)}")
+                etag_tag = caldav.dav.GetEtag.tag
+                self.logger.info(f"🏷️  iCloud CalDAV: GetEtag.tag = {repr(etag_tag)}")
             except Exception as tag_error:
-                self.logger.error(f"❌ iCloud CalDAV: Cannot access GetCtag.tag: {type(tag_error).__name__}: {tag_error}")
+                self.logger.error(f"❌ iCloud CalDAV: Cannot access GetEtag.tag: {type(tag_error).__name__}: {tag_error}")
                 raise
             
-            ctag = props.get(caldav.dav.GetCtag.tag) if props else None
-            self.logger.info(f"🏷️  iCloud CalDAV: CTag extraction result: {repr(ctag)}")
+            etag = props.get(caldav.dav.GetEtag.tag) if props else None
+            self.logger.info(f"🏷️  iCloud CalDAV: ETag extraction result: {repr(etag)}")
             
-            if not ctag:
-                self.logger.error(f"❌ iCloud CalDAV: No CTag found in properties response")
+            if not etag:
+                self.logger.error(f"❌ iCloud CalDAV: No ETag found in properties response")
                 self.logger.error(f"🔍 iCloud CalDAV: Full properties dump: {props}")
                 
                 # Try alternative property access methods
@@ -998,10 +973,10 @@ class iCloudCalendarService(BaseCalendarService):
                     for key, value in props.items():
                         self.logger.error(f"  🔍 Property '{key}': {repr(value)}")
                 
-                raise CalendarServiceError("No CTag returned from iCloud CalDAV")
+                raise CalendarServiceError("No ETag returned from iCloud CalDAV")
                 
-            self.logger.info(f"🎯 iCloud CalDAV: CTag acquired successfully: {ctag}")
-            return ctag
+            self.logger.info(f"🎯 iCloud CalDAV: ETag acquired successfully: {etag}")
+            return etag
             
         except Exception as e:
             raise CalendarServiceError(f"Failed to get iCloud sync token: {e}")
@@ -1081,7 +1056,7 @@ class iCloudCalendarService(BaseCalendarService):
                 None,
                 lambda: calendar.get_properties([
                     caldav.dav.DisplayName(),
-                    caldav.dav.GetCtag(),
+                    caldav.dav.GetEtag(),
                     caldav.dav.SupportedCalendarComponentSet()
                 ])
             )
@@ -1090,7 +1065,7 @@ class iCloudCalendarService(BaseCalendarService):
                 'id': calendar_id,
                 'url': str(calendar.url),
                 'name': props.get(caldav.dav.DisplayName.tag, 'Unknown'),
-                'ctag': props.get(caldav.dav.GetCtag.tag),
+                'etag': props.get(caldav.dav.GetEtag.tag),
                 'supported_components': props.get(caldav.dav.SupportedCalendarComponentSet.tag, [])
             }
             
