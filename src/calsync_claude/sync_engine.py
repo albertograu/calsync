@@ -363,6 +363,26 @@ class SyncEngine:
         google_sync_token = calendar_mapping.google_sync_token
         icloud_sync_token = calendar_mapping.icloud_sync_token
 
+        # CRITICAL FIX: Acquire initial sync tokens if missing
+        # This enables bidirectional sync and deletion detection
+        if not google_sync_token:
+            try:
+                self.logger.info(f"Acquiring initial Google sync token for calendar {google_calendar_id}")
+                google_sync_token = await self.google_service.get_sync_token(google_calendar_id)
+                self.logger.info("✅ Google sync token acquired successfully")
+            except Exception as e:
+                self.logger.warning(f"Failed to acquire Google sync token: {e}. Using time-window sync.")
+                google_sync_token = None
+        
+        if not icloud_sync_token:
+            try:
+                self.logger.info(f"Acquiring initial iCloud sync token for calendar {icloud_calendar_id}")
+                icloud_sync_token = await self.icloud_service.get_sync_token(icloud_calendar_id)
+                self.logger.info("✅ iCloud sync token acquired successfully")
+            except Exception as e:
+                self.logger.warning(f"Failed to acquire iCloud sync token: {e}. Using time-window sync.")
+                icloud_sync_token = None
+
         new_google_sync_token: Optional[str] = None
         new_icloud_sync_token: Optional[str] = None
 
@@ -395,16 +415,43 @@ class SyncEngine:
             if ev.uid:
                 icloud_events_by_uid[ev.uid] = ev
 
-        # Persist new tokens
-        if new_google_sync_token or new_icloud_sync_token:
+        # Persist new tokens (including initially acquired ones)
+        tokens_to_save = (
+            new_google_sync_token or new_icloud_sync_token or 
+            (google_sync_token != calendar_mapping.google_sync_token) or
+            (icloud_sync_token != calendar_mapping.icloud_sync_token)
+        )
+        
+        if tokens_to_save:
             with self.db_manager.get_session() as session:
+                # Refresh the mapping object in this session
+                mapping = session.merge(calendar_mapping)
+                
+                # Save Google token (either new from API or initially acquired)
                 if new_google_sync_token:
-                    calendar_mapping.google_sync_token = new_google_sync_token
-                    calendar_mapping.google_last_updated = datetime.now(pytz.UTC)
+                    mapping.google_sync_token = new_google_sync_token
+                    mapping.google_last_updated = datetime.now(pytz.UTC)
+                elif google_sync_token != calendar_mapping.google_sync_token:
+                    # Initially acquired token
+                    mapping.google_sync_token = google_sync_token
+                    mapping.google_last_updated = datetime.now(pytz.UTC)
+                    self.logger.info("💾 Saved initial Google sync token to database")
+                
+                # Save iCloud token (either new from API or initially acquired)  
                 if new_icloud_sync_token:
-                    calendar_mapping.icloud_sync_token = new_icloud_sync_token
-                    calendar_mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                    mapping.icloud_sync_token = new_icloud_sync_token
+                    mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                elif icloud_sync_token != calendar_mapping.icloud_sync_token:
+                    # Initially acquired token
+                    mapping.icloud_sync_token = icloud_sync_token
+                    mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                    self.logger.info("💾 Saved initial iCloud sync token to database")
+                
                 session.commit()
+                
+                # Update the in-memory object
+                calendar_mapping.google_sync_token = mapping.google_sync_token
+                calendar_mapping.icloud_sync_token = mapping.icloud_sync_token
 
         self.logger.info(
             f"Change sets: Google changed={len(google_events)} deleted={len(google_deleted_ids)}; "
