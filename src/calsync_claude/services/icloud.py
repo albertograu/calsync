@@ -280,9 +280,9 @@ class iCloudCalendarService(BaseCalendarService):
                 try:
                     props = await asyncio.get_event_loop().run_in_executor(
                         None,
-                        lambda: calendar.get_properties([caldav.dav.GetCTag()])
+                        lambda: calendar.get_properties([caldav.dav.GetCtag()])
                     )
-                    next_token = props.get(caldav.dav.GetCTag.tag)
+                    next_token = props.get(caldav.dav.GetCtag.tag)
                 except Exception:
                     next_token = None
 
@@ -923,16 +923,17 @@ class iCloudCalendarService(BaseCalendarService):
             # This serves as our sync token for CalDAV
             self.logger.info(f"📊 iCloud CalDAV: Requesting calendar properties (CTag)")
             
+            # CRITICAL FIX: Use correct CalDAV import - GetCtag not GetCTag
             props = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: calendar.get_properties([caldav.dav.GetCTag()])
+                lambda: calendar.get_properties([caldav.dav.GetCtag()])
             )
             
             self.logger.info(f"📥 iCloud CalDAV: Properties response received")
             self.logger.info(f"🔍 iCloud CalDAV: Available properties: {list(props.keys()) if props else 'None'}")
             
-            ctag = props.get(caldav.dav.GetCTag.tag) if props else None
-            self.logger.info(f"🏷️  iCloud CalDAV: CTag extraction - CTag tag: {caldav.dav.GetCTag.tag}")
+            ctag = props.get(caldav.dav.GetCtag.tag) if props else None
+            self.logger.info(f"🏷️  iCloud CalDAV: CTag extraction - CTag tag: {caldav.dav.GetCtag.tag}")
             self.logger.info(f"🏷️  iCloud CalDAV: CTag value: {repr(ctag)}")
             
             if not ctag:
@@ -1021,7 +1022,7 @@ class iCloudCalendarService(BaseCalendarService):
                 None,
                 lambda: calendar.get_properties([
                     caldav.dav.DisplayName(),
-                    caldav.dav.GetCTag(),
+                    caldav.dav.GetCtag(),
                     caldav.dav.SupportedCalendarComponentSet()
                 ])
             )
@@ -1030,7 +1031,7 @@ class iCloudCalendarService(BaseCalendarService):
                 'id': calendar_id,
                 'url': str(calendar.url),
                 'name': props.get(caldav.dav.DisplayName.tag, 'Unknown'),
-                'ctag': props.get(caldav.dav.GetCTag.tag),
+                'ctag': props.get(caldav.dav.GetCtag.tag),
                 'supported_components': props.get(caldav.dav.SupportedCalendarComponentSet.tag, [])
             }
             

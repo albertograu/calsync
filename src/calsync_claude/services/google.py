@@ -723,12 +723,20 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
-            # CRITICAL FIX: To get a sync token, we must paginate through ALL events
-            # A partial query won't return nextSyncToken
+            # CRITICAL FIX: Google Calendar API requires time bounds to return nextSyncToken
+            # Must use a specific time window for the initial sync token acquisition
+            from datetime import datetime, timedelta
+            import pytz
+            
+            now = datetime.now(pytz.UTC)
+            time_min = now - timedelta(days=365)  # Look back 1 year for comprehensive token
+            time_max = now + timedelta(days=365)  # Look ahead 1 year
+            
             page_token = None
             sync_token = None
             
-            self.logger.info(f"📊 Google API: Starting full pagination to acquire sync token")
+            self.logger.info(f"📊 Google API: Acquiring sync token with time bounds")
+            self.logger.info(f"  📅 Time range: {time_min.isoformat()} to {time_max.isoformat()}")
             page_count = 0
             total_events = 0
             
@@ -738,7 +746,9 @@ class GoogleCalendarService(BaseCalendarService):
                     'calendarId': calendar_id,
                     'maxResults': 250,  # Max per page
                     'singleEvents': True,
-                    'orderBy': 'startTime'
+                    'orderBy': 'startTime',
+                    'timeMin': time_min.isoformat(),
+                    'timeMax': time_max.isoformat()
                 }
                 if page_token:
                     params['pageToken'] = page_token
