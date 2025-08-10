@@ -69,10 +69,14 @@ class ConflictResolver:
         
         # Sequence-based resolution failed, use configured strategy
         if strategy == ConflictResolution.LATEST_WINS:
-            if google_event.updated > icloud_event.updated:
-                return google_event, f"Auto-resolved: Google event is more recent ({google_event.updated} > {icloud_event.updated})"
-            elif icloud_event.updated > google_event.updated:
-                return icloud_event, f"Auto-resolved: iCloud event is more recent ({icloud_event.updated} > {google_event.updated})"
+            # Ensure both timestamps are timezone-aware for comparison
+            google_updated = self._ensure_timezone_aware(google_event.updated)
+            icloud_updated = self._ensure_timezone_aware(icloud_event.updated)
+            
+            if google_updated > icloud_updated:
+                return google_event, f"Auto-resolved: Google event is more recent ({google_updated} > {icloud_updated})"
+            elif icloud_updated > google_updated:
+                return icloud_event, f"Auto-resolved: iCloud event is more recent ({icloud_updated} > {google_updated})"
             else:
                 # Same timestamp, prefer Google as tiebreaker for consistency
                 return google_event, "Auto-resolved: Equal timestamps, Google wins (tiebreaker)"
@@ -85,7 +89,9 @@ class ConflictResolver:
         
         else:
             # Fallback for unknown strategies - prefer latest
-            if google_event.updated > icloud_event.updated:
+            google_updated = self._ensure_timezone_aware(google_event.updated)
+            icloud_updated = self._ensure_timezone_aware(icloud_event.updated)
+            if google_updated > icloud_updated:
                 return google_event, f"Auto-resolved: Unknown strategy '{strategy}', defaulted to latest (Google)"
             else:
                 return icloud_event, f"Auto-resolved: Unknown strategy '{strategy}', defaulted to latest (iCloud)"
@@ -1384,3 +1390,22 @@ class SyncEngine:
             
             if patterns:
                 self.logger.debug(f"HREF patterns: {list(patterns)[:3]}")
+    
+    def _ensure_timezone_aware(self, dt: datetime) -> datetime:
+        """Ensure datetime is timezone-aware for safe comparison.
+        
+        Args:
+            dt: Datetime object that may be timezone-naive or timezone-aware
+            
+        Returns:
+            Timezone-aware datetime (assumes UTC for naive datetimes)
+        """
+        if dt.tzinfo is None:
+            # Naive datetime - assume UTC
+            return dt.replace(tzinfo=pytz.UTC)
+        elif dt.tzinfo.utcoffset(dt) is None:
+            # Invalid timezone info  
+            return dt.replace(tzinfo=pytz.UTC)
+        else:
+            # Already timezone-aware
+            return dt
