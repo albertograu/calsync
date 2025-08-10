@@ -269,7 +269,7 @@ class CalendarManager:
                 )
         
         # Handle special case: map remaining iCloud calendars to Google primary
-        if remaining_icloud and self.settings.sync_config.auto_create_calendars:
+        if remaining_icloud and self.settings.sync_config.auto_create_pairs:
             primary_google = next((c for c in google_calendars if c.is_primary), None)
             if primary_google and primary_google.id not in used_google:
                 for icloud_cal in remaining_icloud[:]:  # Copy list to modify during iteration
@@ -354,7 +354,7 @@ class CalendarManager:
         Returns:
             List of newly created calendar pairs
         """
-        if not self.settings.sync_config.auto_create_calendars:
+        if not self.settings.sync_config.auto_create_pairs:
             self.logger.info("Auto-create calendars disabled, skipping creation")
             return []
         
