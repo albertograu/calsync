@@ -579,7 +579,7 @@ async def delete_mapping(ctx, mapping_id):
 
 @calendars.command('auto-map')
 @click.option('--dry-run', '-n', is_flag=True, help='Show what would be mapped without creating')
-@click.pass_context
+@async_command
 async def auto_map_calendars(ctx, dry_run):
     """Automatically create calendar mappings based on name matching."""
     settings = ctx.obj['settings']
