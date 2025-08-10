@@ -338,6 +338,10 @@ class CalendarManager:
                     f"Created mapping: {google_cal.name} <-> {icloud_cal.name}"
                 )
         
+            # Expunge all objects from session so they can be used outside the session
+            for mapping in mappings:
+                session.expunge(mapping)
+        
         return mappings
     
     async def create_missing_calendars(
