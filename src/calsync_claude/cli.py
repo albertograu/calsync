@@ -734,7 +734,19 @@ def _display_sync_results(sync_report, compact=False):
     console.print(table)
     
     # Summary
-    duration = sync_report.completed_at - sync_report.started_at if sync_report.completed_at else None
+    duration = None
+    if sync_report.completed_at:
+        # Ensure both timestamps are timezone-aware for subtraction
+        import pytz
+        completed = sync_report.completed_at
+        if completed.tzinfo is None:
+            completed = completed.replace(tzinfo=pytz.UTC)
+        
+        started = sync_report.started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=pytz.UTC)
+        
+        duration = completed - started
     if duration:
         console.print(f"[dim]Completed in {duration.total_seconds():.1f} seconds[/dim]")
 
