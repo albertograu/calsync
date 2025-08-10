@@ -410,6 +410,9 @@ class SyncEngine:
             existing_mappings = session.query(EventMappingDB).filter(
                 EventMappingDB.calendar_mapping_id == calendar_mapping.id
             ).all()
+            # Expunge all objects from session so they can be used outside the session
+            for mapping in existing_mappings:
+                session.expunge(mapping)
         
         mappings_by_google = {m.google_event_id: m for m in existing_mappings if m.google_event_id}
         mappings_by_icloud = {m.icloud_event_id: m for m in existing_mappings if m.icloud_event_id}
