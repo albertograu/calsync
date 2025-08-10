@@ -116,6 +116,17 @@ class GoogleCalendarService(BaseCalendarService):
     
     async def _create_credentials_file(self) -> None:
         """Create Google OAuth credentials file."""
+        # Check if running in Docker (headless) or local environment
+        import os
+        is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER') == 'true'
+        
+        if is_docker:
+            # For headless/server deployment, use OOB (though deprecated)
+            redirect_uris = ["urn:ietf:wg:oauth:2.0:oob"]
+        else:
+            # For local development, use localhost redirect URIs
+            redirect_uris = ["http://localhost"]
+        
         credentials_data = {
             "installed": {
                 "client_id": self.settings.google_client_id,
@@ -123,7 +134,7 @@ class GoogleCalendarService(BaseCalendarService):
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
                 "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"]
+                "redirect_uris": redirect_uris
             }
         }
         
