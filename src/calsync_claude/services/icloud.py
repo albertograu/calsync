@@ -180,8 +180,11 @@ class iCloudCalendarService(BaseCalendarService):
                     formatted_event = self._parse_caldav_event(event)
                     if formatted_event:
                         # Filter by updated_min if specified
-                        if updated_min and formatted_event.updated < updated_min:
-                            continue
+                        if updated_min:
+                            event_updated = self._ensure_timezone_aware(formatted_event.updated)
+                            min_updated = self._ensure_timezone_aware(updated_min)
+                            if event_updated < min_updated:
+                                continue
                         
                         yield formatted_event
                         events_yielded += 1
@@ -265,8 +268,11 @@ class iCloudCalendarService(BaseCalendarService):
                         break
                     parsed = self._parse_caldav_event(ev)
                     if parsed:
-                        if updated_min and parsed.updated < updated_min:
-                            continue
+                        if updated_min:
+                            parsed_updated = self._ensure_timezone_aware(parsed.updated)
+                            min_updated = self._ensure_timezone_aware(updated_min)
+                            if parsed_updated < min_updated:
+                                continue
                         native_id = str(ev.url) if hasattr(ev, 'url') else parsed.id
                         changed[native_id] = parsed
                         count += 1

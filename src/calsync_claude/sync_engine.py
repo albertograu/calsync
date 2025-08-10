@@ -709,8 +709,13 @@ class SyncEngine:
         """
         # Check if both events have been modified since last sync
         if mapping.last_sync_at:
-            source_modified = source_event.updated > mapping.last_sync_at
-            target_modified = target_event.updated > mapping.last_sync_at
+            # Ensure timezone-aware comparison
+            source_updated = self._ensure_timezone_aware(source_event.updated)
+            target_updated = self._ensure_timezone_aware(target_event.updated)
+            last_sync = self._ensure_timezone_aware(mapping.last_sync_at)
+            
+            source_modified = source_updated > last_sync
+            target_modified = target_updated > last_sync
             
             if source_modified and target_modified:
                 # Both modified - potential conflict
