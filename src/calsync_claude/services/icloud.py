@@ -278,10 +278,11 @@ class iCloudCalendarService(BaseCalendarService):
                         count += 1
                 # Try to get a token for next run
                 try:
-                    next_token = await asyncio.get_event_loop().run_in_executor(
+                    props = await asyncio.get_event_loop().run_in_executor(
                         None,
-                        lambda: calendar.get_ctag()
+                        lambda: calendar.get_properties([caldav.dav.GetCTag()])
                     )
+                    next_token = props.get(caldav.dav.GetCTag.tag)
                 except Exception:
                     next_token = None
 
@@ -910,20 +911,36 @@ class iCloudCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
+            self.logger.info(f"🔍 iCloud CalDAV: Looking up calendar by ID: {calendar_id}")
             calendar = await self._find_calendar_by_id(calendar_id)
             if not calendar:
+                self.logger.error(f"❌ iCloud CalDAV: Calendar not found: {calendar_id}")
                 raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
+            
+            self.logger.info(f"✅ iCloud CalDAV: Calendar found - URL: {calendar.url}")
             
             # Get the current CTag (Calendar Collection Tag)
             # This serves as our sync token for CalDAV
-            ctag = await asyncio.get_event_loop().run_in_executor(
+            self.logger.info(f"📊 iCloud CalDAV: Requesting calendar properties (CTag)")
+            
+            props = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: calendar.get_ctag()
+                lambda: calendar.get_properties([caldav.dav.GetCTag()])
             )
             
+            self.logger.info(f"📥 iCloud CalDAV: Properties response received")
+            self.logger.info(f"🔍 iCloud CalDAV: Available properties: {list(props.keys()) if props else 'None'}")
+            
+            ctag = props.get(caldav.dav.GetCTag.tag) if props else None
+            self.logger.info(f"🏷️  iCloud CalDAV: CTag extraction - CTag tag: {caldav.dav.GetCTag.tag}")
+            self.logger.info(f"🏷️  iCloud CalDAV: CTag value: {repr(ctag)}")
+            
             if not ctag:
+                self.logger.error(f"❌ iCloud CalDAV: No CTag found in properties response")
+                self.logger.error(f"🔍 iCloud CalDAV: Full properties dump: {props}")
                 raise CalendarServiceError("No CTag returned from iCloud CalDAV")
                 
+            self.logger.info(f"🎯 iCloud CalDAV: CTag acquired successfully: {ctag}")
             return ctag
             
         except Exception as e:

@@ -723,20 +723,54 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
-            # Get a sync token by doing a minimal query
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.service.events().list(
-                    calendarId=calendar_id,
-                    maxResults=1,
-                    singleEvents=True
-                ).execute()
-            )
+            # CRITICAL FIX: To get a sync token, we must paginate through ALL events
+            # A partial query won't return nextSyncToken
+            page_token = None
+            sync_token = None
             
-            sync_token = result.get('nextSyncToken')
-            if not sync_token:
-                raise CalendarServiceError("No sync token returned from Google Calendar API")
+            self.logger.info(f"📊 Google API: Starting full pagination to acquire sync token")
+            page_count = 0
+            total_events = 0
+            
+            while True:
+                page_count += 1
+                params = {
+                    'calendarId': calendar_id,
+                    'maxResults': 250,  # Max per page
+                    'singleEvents': True,
+                    'orderBy': 'startTime'
+                }
+                if page_token:
+                    params['pageToken'] = page_token
                 
+                self.logger.info(f"📄 Google API: Requesting page {page_count} (maxResults=250)")
+                
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.service.events().list(**params).execute()
+                )
+                
+                events_this_page = len(result.get('items', []))
+                total_events += events_this_page
+                self.logger.info(f"📥 Google API: Page {page_count} returned {events_this_page} events (total: {total_events})")
+                
+                # Check for next page
+                page_token = result.get('nextPageToken')
+                sync_token_on_page = result.get('nextSyncToken')
+                
+                self.logger.info(f"🔄 Google API: Page {page_count} - nextPageToken: {'✅' if page_token else '❌'} | nextSyncToken: {'✅' if sync_token_on_page else '❌'}")
+                
+                # Sync token is only available on the final page
+                if not page_token:
+                    sync_token = sync_token_on_page
+                    self.logger.info(f"🏁 Google API: Final page {page_count} reached - total events enumerated: {total_events}")
+                    break
+            
+            if not sync_token:
+                self.logger.error(f"❌ Google API: No nextSyncToken found after {page_count} pages ({total_events} events)")
+                raise CalendarServiceError("No sync token returned from Google Calendar API after full pagination")
+                
+            self.logger.info(f"🎯 Google API: Sync token acquired successfully after {page_count} pages")
             return sync_token
             
         except HttpError as e:

@@ -365,23 +365,46 @@ class SyncEngine:
 
         # CRITICAL FIX: Acquire initial sync tokens if missing
         # This enables bidirectional sync and deletion detection
+        self.logger.info(f"🔍 SYNC TOKEN STATUS CHECK:")
+        self.logger.info(f"  📅 Calendar Mapping ID: {calendar_mapping.id}")
+        self.logger.info(f"  🟢 Google Calendar: {calendar_mapping.google_calendar_name or 'Unknown'} ({google_calendar_id})")
+        self.logger.info(f"  🍎 iCloud Calendar: {calendar_mapping.icloud_calendar_name or 'Unknown'} ({icloud_calendar_id})")
+        self.logger.info(f"  🔑 Google Sync Token: {'✅ EXISTS' if google_sync_token else '❌ MISSING'}")
+        self.logger.info(f"  🔑 iCloud Sync Token: {'✅ EXISTS' if icloud_sync_token else '❌ MISSING'}")
+        
         if not google_sync_token:
+            self.logger.info(f"🚀 ACQUIRING GOOGLE SYNC TOKEN for calendar {google_calendar_id}")
             try:
-                self.logger.info(f"Acquiring initial Google sync token for calendar {google_calendar_id}")
                 google_sync_token = await self.google_service.get_sync_token(google_calendar_id)
-                self.logger.info("✅ Google sync token acquired successfully")
+                self.logger.info(f"✅ Google sync token acquired successfully: {google_sync_token[:50]}...")
+                self.logger.info("🎯 Google incremental sync now ENABLED")
             except Exception as e:
-                self.logger.warning(f"Failed to acquire Google sync token: {e}. Using time-window sync.")
+                self.logger.error(f"❌ Failed to acquire Google sync token: {type(e).__name__}: {e}")
+                self.logger.warning("⚠️  Falling back to time-window sync for Google (no deletion detection)")
                 google_sync_token = None
+        else:
+            self.logger.info(f"🔄 Using existing Google sync token: {google_sync_token[:50]}...")
         
         if not icloud_sync_token:
+            self.logger.info(f"🚀 ACQUIRING ICLOUD SYNC TOKEN for calendar {icloud_calendar_id}")
             try:
-                self.logger.info(f"Acquiring initial iCloud sync token for calendar {icloud_calendar_id}")
                 icloud_sync_token = await self.icloud_service.get_sync_token(icloud_calendar_id)
-                self.logger.info("✅ iCloud sync token acquired successfully")
+                self.logger.info(f"✅ iCloud sync token acquired successfully: {icloud_sync_token[:50] if len(str(icloud_sync_token)) > 50 else icloud_sync_token}")
+                self.logger.info("🎯 iCloud incremental sync now ENABLED")
             except Exception as e:
-                self.logger.warning(f"Failed to acquire iCloud sync token: {e}. Using time-window sync.")
+                self.logger.error(f"❌ Failed to acquire iCloud sync token: {type(e).__name__}: {e}")
+                self.logger.warning("⚠️  Falling back to time-window sync for iCloud (no deletion detection)")
                 icloud_sync_token = None
+        else:
+            self.logger.info(f"🔄 Using existing iCloud sync token: {icloud_sync_token[:50] if len(str(icloud_sync_token)) > 50 else icloud_sync_token}...")
+        
+        self.logger.info(f"🔐 FINAL TOKEN STATUS: Google={'✅' if google_sync_token else '❌'} | iCloud={'✅' if icloud_sync_token else '❌'}")
+        if google_sync_token and icloud_sync_token:
+            self.logger.info("🎉 BIDIRECTIONAL SYNC WITH DELETION DETECTION ENABLED!")
+        elif google_sync_token or icloud_sync_token:
+            self.logger.info("⚡ PARTIAL INCREMENTAL SYNC ENABLED (limited deletion detection)")
+        else:
+            self.logger.warning("⚠️  TIME-WINDOW SYNC ONLY (no reliable deletion detection)")
 
         new_google_sync_token: Optional[str] = None
         new_icloud_sync_token: Optional[str] = None
@@ -416,6 +439,12 @@ class SyncEngine:
                 icloud_events_by_uid[ev.uid] = ev
 
         # Persist new tokens (including initially acquired ones)
+        self.logger.info("🔍 SYNC TOKEN PERSISTENCE CHECK:")
+        self.logger.info(f"  🆕 New Google token from API: {'✅' if new_google_sync_token else '❌'}")
+        self.logger.info(f"  🆕 New iCloud token from API: {'✅' if new_icloud_sync_token else '❌'}")
+        self.logger.info(f"  🔄 Google token changed: {'✅' if (google_sync_token != calendar_mapping.google_sync_token) else '❌'}")
+        self.logger.info(f"  🔄 iCloud token changed: {'✅' if (icloud_sync_token != calendar_mapping.icloud_sync_token) else '❌'}")
+        
         tokens_to_save = (
             new_google_sync_token or new_icloud_sync_token or 
             (google_sync_token != calendar_mapping.google_sync_token) or
@@ -423,35 +452,60 @@ class SyncEngine:
         )
         
         if tokens_to_save:
-            with self.db_manager.get_session() as session:
-                # Refresh the mapping object in this session
-                mapping = session.merge(calendar_mapping)
-                
-                # Save Google token (either new from API or initially acquired)
-                if new_google_sync_token:
-                    mapping.google_sync_token = new_google_sync_token
-                    mapping.google_last_updated = datetime.now(pytz.UTC)
-                elif google_sync_token != calendar_mapping.google_sync_token:
-                    # Initially acquired token
-                    mapping.google_sync_token = google_sync_token
-                    mapping.google_last_updated = datetime.now(pytz.UTC)
-                    self.logger.info("💾 Saved initial Google sync token to database")
-                
-                # Save iCloud token (either new from API or initially acquired)  
-                if new_icloud_sync_token:
-                    mapping.icloud_sync_token = new_icloud_sync_token
-                    mapping.icloud_last_updated = datetime.now(pytz.UTC)
-                elif icloud_sync_token != calendar_mapping.icloud_sync_token:
-                    # Initially acquired token
-                    mapping.icloud_sync_token = icloud_sync_token
-                    mapping.icloud_last_updated = datetime.now(pytz.UTC)
-                    self.logger.info("💾 Saved initial iCloud sync token to database")
-                
-                session.commit()
-                
-                # Update the in-memory object
-                calendar_mapping.google_sync_token = mapping.google_sync_token
-                calendar_mapping.icloud_sync_token = mapping.icloud_sync_token
+            self.logger.info("💾 SAVING SYNC TOKENS TO DATABASE...")
+            try:
+                with self.db_manager.get_session() as session:
+                    # Refresh the mapping object in this session
+                    mapping = session.merge(calendar_mapping)
+                    self.logger.info(f"🔄 Database: Merged calendar mapping ID {mapping.id}")
+                    
+                    # Save Google token (either new from API or initially acquired)
+                    if new_google_sync_token:
+                        old_token = mapping.google_sync_token
+                        mapping.google_sync_token = new_google_sync_token
+                        mapping.google_last_updated = datetime.now(pytz.UTC)
+                        self.logger.info(f"💾 Database: Updated Google sync token (from API response)")
+                        self.logger.info(f"  📊 Old: {old_token[:50] if old_token else 'None'}...")
+                        self.logger.info(f"  📊 New: {new_google_sync_token[:50]}...")
+                    elif google_sync_token != calendar_mapping.google_sync_token:
+                        # Initially acquired token
+                        old_token = mapping.google_sync_token
+                        mapping.google_sync_token = google_sync_token
+                        mapping.google_last_updated = datetime.now(pytz.UTC)
+                        self.logger.info(f"💾 Database: Saved initial Google sync token")
+                        self.logger.info(f"  📊 Old: {old_token[:50] if old_token else 'None'}...")
+                        self.logger.info(f"  📊 New: {google_sync_token[:50]}...")
+                    
+                    # Save iCloud token (either new from API or initially acquired)  
+                    if new_icloud_sync_token:
+                        old_token = mapping.icloud_sync_token
+                        mapping.icloud_sync_token = new_icloud_sync_token
+                        mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                        self.logger.info(f"💾 Database: Updated iCloud sync token (from API response)")
+                        self.logger.info(f"  📊 Old: {old_token if old_token else 'None'}")
+                        self.logger.info(f"  📊 New: {new_icloud_sync_token}")
+                    elif icloud_sync_token != calendar_mapping.icloud_sync_token:
+                        # Initially acquired token
+                        old_token = mapping.icloud_sync_token
+                        mapping.icloud_sync_token = icloud_sync_token
+                        mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                        self.logger.info(f"💾 Database: Saved initial iCloud sync token")
+                        self.logger.info(f"  📊 Old: {old_token if old_token else 'None'}")
+                        self.logger.info(f"  📊 New: {icloud_sync_token}")
+                    
+                    session.commit()
+                    self.logger.info("✅ Database: Sync tokens committed successfully")
+                    
+                    # Update the in-memory object
+                    calendar_mapping.google_sync_token = mapping.google_sync_token
+                    calendar_mapping.icloud_sync_token = mapping.icloud_sync_token
+                    self.logger.info("🔄 Memory: In-memory calendar mapping updated")
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Database: Failed to save sync tokens: {type(e).__name__}: {e}")
+                raise
+        else:
+            self.logger.info("⏭️  No sync tokens to save - all up to date")
 
         self.logger.info(
             f"Change sets: Google changed={len(google_events)} deleted={len(google_deleted_ids)}; "
@@ -912,17 +966,34 @@ class SyncEngine:
         has_google_sync_token = bool(calendar_mapping.google_sync_token)
         has_icloud_sync_token = bool(calendar_mapping.icloud_sync_token)
         
+        self.logger.info("🗑️  DELETION DETECTION CHECK:")
+        self.logger.info(f"  📅 Calendar Mapping ID: {calendar_mapping.id}")
+        self.logger.info(f"  🔑 Google sync token available: {'✅' if has_google_sync_token else '❌'}")
+        self.logger.info(f"  🔑 iCloud sync token available: {'✅' if has_icloud_sync_token else '❌'}")
+        self.logger.info(f"  🗑️  Google deletion candidates: {len(google_deleted_ids)}")
+        self.logger.info(f"  🗑️  iCloud deletion candidates: {len(icloud_deleted_ids)}")
+        
         if not has_google_sync_token and not has_icloud_sync_token:
-            self.logger.warning(
-                "Skipping deletion detection - no sync tokens available. "
-                "Time window sync cannot reliably detect deletions."
-            )
+            self.logger.warning("❌ DELETION DETECTION DISABLED")
+            self.logger.warning("  🚫 No sync tokens available for reliable deletion detection")
+            self.logger.warning("  ⚠️  Time window sync cannot detect deletions safely")
             return
         
+        self.logger.info("✅ DELETION DETECTION ENABLED")
+        if has_google_sync_token and has_icloud_sync_token:
+            self.logger.info("  🎯 Full bidirectional deletion detection active")
+        elif has_google_sync_token:
+            self.logger.info("  📱 Google→iCloud deletion detection active (iCloud→Google limited)")
+        else:
+            self.logger.info("  🍎 iCloud→Google deletion detection active (Google→iCloud limited)")
+        
         # Log counts for audit
-        self.logger.info(
-            f"Deletion candidates - Google: {len(google_deleted_ids)}; iCloud: {len(icloud_deleted_ids)}"
-        )
+        if google_deleted_ids:
+            self.logger.info(f"  🗑️  Google deleted IDs: {list(google_deleted_ids)[:5]}{'...' if len(google_deleted_ids) > 5 else ''}")
+        if icloud_deleted_ids:
+            self.logger.info(f"  🗑️  iCloud deleted IDs: {list(icloud_deleted_ids)[:5]}{'...' if len(icloud_deleted_ids) > 5 else ''}")
+        
+        self.logger.info(f"📊 Processing {len(mappings)} event mappings for deletion check")
 
         for mapping in mappings:
             # Only check active mappings
