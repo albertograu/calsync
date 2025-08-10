@@ -55,31 +55,40 @@ class GoogleCalendarService(BaseCalendarService):
                     # Create credentials file for OAuth flow
                     await self._create_credentials_file()
                     
-                    # For headless deployment, provide clear setup instructions
-                    self.logger.error(
-                        f"\n{'='*80}\n"
-                        f"GOOGLE OAUTH SETUP REQUIRED FOR HEADLESS DEPLOYMENT\n"
-                        f"{'='*80}\n"
-                        f"Option 1 - Generate token locally and copy:\n"
-                        f"1. On your local machine with a browser, run:\n"
-                        f"   pip install calsync-claude\n"
-                        f"   calsync-claude test\n"
-                        f"2. Complete OAuth in browser\n"
-                        f"3. Copy the token file:\n"
-                        f"   scp ~/.calsync-claude/credentials/google_token.json \\\n"
-                        f"       root@your-vps:./data/credentials/\n\n"
-                        f"Option 2 - Manual OAuth (advanced):\n"
-                        f"1. Update your Google OAuth app redirect URI to include:\n"
-                        f"   http://localhost:8080\n"
-                        f"2. Restart with: docker compose ... up --build\n"
-                        f"3. The daemon will provide a URL to authenticate\n\n"
-                        f"Current credentials path: {self.settings.google_token_path}\n"
-                        f"{'='*80}"
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        str(self.settings.google_credentials_path),
+                        self.settings.google_scopes
                     )
                     
-                    raise AuthenticationError(
-                        f"Google OAuth token not found. Please follow setup instructions in logs above."
-                    )
+                    # Check if running in Docker (headless) or local environment
+                    import os
+                    is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER') == 'true'
+                    
+                    if is_docker:
+                        # Headless Docker environment - provide setup instructions
+                        self.logger.error(
+                            f"\n{'='*80}\n"
+                            f"GOOGLE OAUTH SETUP REQUIRED FOR HEADLESS DEPLOYMENT\n"
+                            f"{'='*80}\n"
+                            f"Option 1 - Generate token locally and copy:\n"
+                            f"1. On your local machine with a browser, run:\n"
+                            f"   pip install calsync-claude\n"
+                            f"   calsync-claude test\n"
+                            f"2. Complete OAuth in browser\n"
+                            f"3. Copy the token file:\n"
+                            f"   scp ~/.calsync-claude/credentials/google_token.json \\\n"
+                            f"       root@your-vps:./data/credentials/\n\n"
+                            f"Current credentials path: {self.settings.google_token_path}\n"
+                            f"{'='*80}"
+                        )
+                        raise AuthenticationError(
+                            f"Google OAuth token not found. Please follow setup instructions in logs above."
+                        )
+                    else:
+                        # Local environment with browser - use normal OAuth flow
+                        self.logger.info("Starting Google OAuth flow in browser...")
+                        creds = flow.run_local_server(port=0)
+                        self.logger.info("OAuth flow completed successfully")
                 
                 # Save credentials for next run with secure permissions
                 token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
