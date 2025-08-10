@@ -55,38 +55,31 @@ class GoogleCalendarService(BaseCalendarService):
                     # Create credentials file for OAuth flow
                     await self._create_credentials_file()
                     
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        str(self.settings.google_credentials_path),
-                        self.settings.google_scopes
-                    )
-                    # Use out-of-band (OOB) flow for headless servers
-                    auth_url, _ = flow.authorization_url(prompt='consent')
-                    
+                    # For headless deployment, provide clear setup instructions
                     self.logger.error(
-                        f"\n{'='*60}\n"
-                        f"GOOGLE OAUTH SETUP REQUIRED\n"
-                        f"{'='*60}\n"
-                        f"1. Open this URL in your browser:\n"
-                        f"   {auth_url}\n\n"
-                        f"2. Grant permissions and copy the authorization code\n\n"
-                        f"3. Set the code as environment variable:\n"
-                        f"   docker compose -f docker-compose.secrets.yml exec calsync \\\n"
-                        f"   /bin/bash -c 'export GOOGLE_AUTH_CODE=your_code_here && calsync-claude sync --dry-run'\n\n"
-                        f"Or copy a pre-generated token file to ./data/credentials/google_token.json\n"
-                        f"{'='*60}"
+                        f"\n{'='*80}\n"
+                        f"GOOGLE OAUTH SETUP REQUIRED FOR HEADLESS DEPLOYMENT\n"
+                        f"{'='*80}\n"
+                        f"Option 1 - Generate token locally and copy:\n"
+                        f"1. On your local machine with a browser, run:\n"
+                        f"   pip install calsync-claude\n"
+                        f"   calsync-claude test\n"
+                        f"2. Complete OAuth in browser\n"
+                        f"3. Copy the token file:\n"
+                        f"   scp ~/.calsync-claude/credentials/google_token.json \\\n"
+                        f"       root@your-vps:./data/credentials/\n\n"
+                        f"Option 2 - Manual OAuth (advanced):\n"
+                        f"1. Update your Google OAuth app redirect URI to include:\n"
+                        f"   http://localhost:8080\n"
+                        f"2. Restart with: docker compose ... up --build\n"
+                        f"3. The daemon will provide a URL to authenticate\n\n"
+                        f"Current credentials path: {self.settings.google_token_path}\n"
+                        f"{'='*80}"
                     )
                     
-                    # Check for authorization code in environment
-                    import os
-                    auth_code = os.environ.get('GOOGLE_AUTH_CODE')
-                    if auth_code:
-                        flow.fetch_token(code=auth_code)
-                        creds = flow.credentials
-                        self.logger.info("Successfully authenticated using authorization code")
-                    else:
-                        raise AuthenticationError(
-                            f"Google OAuth setup required. See logs above for instructions."
-                        )
+                    raise AuthenticationError(
+                        f"Google OAuth token not found. Please follow setup instructions in logs above."
+                    )
                 
                 # Save credentials for next run with secure permissions
                 token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
