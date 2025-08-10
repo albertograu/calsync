@@ -175,6 +175,7 @@ class SyncSessionDB(Base):
     __tablename__ = 'sync_sessions'
     
     id = Column(GUID(), primary_key=True, default=uuid4)
+    calendar_mapping_id = Column(GUID(), ForeignKey('calendar_mappings.id'), nullable=True, index=True)
     started_at = Column(DateTime, nullable=False, default=lambda: datetime.now(pytz.UTC))
     completed_at = Column(DateTime, nullable=True)
     dry_run = Column(Boolean, nullable=False, default=False)
@@ -195,6 +196,7 @@ class SyncSessionDB(Base):
     error_message = Column(Text, nullable=True)
     
     # Relationships
+    calendar_mapping = relationship("CalendarMappingDB")
     sync_operations = relationship("SyncOperationDB", back_populates="sync_session")
     conflicts = relationship("ConflictDB", back_populates="sync_session")
     
@@ -204,6 +206,7 @@ class SyncSessionDB(Base):
         Index('idx_sync_session_completed', 'completed_at'),
         Index('idx_sync_session_status', 'status'),
         Index('idx_sync_session_dry_run', 'dry_run'),
+        Index('idx_sync_session_calendar_mapping', 'calendar_mapping_id'),
     )
 
 
