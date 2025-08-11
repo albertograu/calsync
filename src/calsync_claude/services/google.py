@@ -482,6 +482,10 @@ class GoogleCalendarService(BaseCalendarService):
     ) -> CalendarEvent:
         """Create event with retry logic using validated calendar ID."""
         try:
+            # CRITICAL DEBUG: This should always appear in logs
+            print(f"🚨 DEBUG: Creating Google event for '{event_data.summary}' with UID: {event_data.uid}")
+            self.logger.error(f"🚨 DEBUG: Creating Google event for '{event_data.summary}' with UID: {event_data.uid}")
+            
             # Convert event data WITH event ID generation to prevent duplicates
             # This follows Google's best practice: "generate your own unique event ID"
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
@@ -1048,12 +1052,16 @@ class GoogleCalendarService(BaseCalendarService):
         # iCloud uses UUID format (with hyphens) which is invalid for Google Calendar
         # Google Calendar event IDs must be base32hex format [a-v0-9] only
         if use_event_id and event.uid:
-            self.logger.info(f"🔍 Generating Google Calendar event ID for '{event.summary}' (UID: {event.uid})")
+            print(f"🚨 CONVERTING UID TO EVENT ID: {event.uid}")
+            self.logger.error(f"🚨 CONVERTING UID TO EVENT ID: {event.uid}")
             
-            # ALWAYS generate compliant ID - ignore recurrence override detection
+            # ALWAYS generate compliant ID - ignore recurrence override detection  
             # The recurrence detection logic has issues with orphaned events
             event_id = self._generate_compliant_event_id(event.uid)
             google_event['id'] = event_id
+            
+            print(f"🚨 GENERATED EVENT ID: {event_id}")
+            self.logger.error(f"🚨 GENERATED EVENT ID: {event_id}")
             
             self.logger.info(f"✅ Generated compliant event ID: '{event_id}' (length: {len(event_id)})")
             self.logger.info(f"   → Original UID: {event.uid}")
