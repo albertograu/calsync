@@ -445,11 +445,6 @@ class GoogleCalendarService(BaseCalendarService):
         except Exception as e:
             raise CalendarServiceError(f"Failed to get Google event: {e}")
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((HttpError, CalendarServiceError))
-    )
     async def create_event(
         self,
         calendar_id: str,
@@ -458,13 +453,27 @@ class GoogleCalendarService(BaseCalendarService):
         """Create a new Google Calendar event."""
         self._ensure_authenticated()
         
+        self.logger.info(f"🔍 Creating Google Calendar event with ID: {calendar_id}")
+        
+        # CRITICAL FIX: Validate calendar ID BEFORE retry loop
+        validated_calendar_id = await self._validate_calendar_id(calendar_id)
+        self.logger.info(f"✅ Validated calendar ID: {validated_calendar_id}")
+        
+        # Now do the actual creation with retry using the validated ID
+        return await self._create_event_with_retry(validated_calendar_id, event_data)
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((HttpError, CalendarServiceError))
+    )
+    async def _create_event_with_retry(
+        self,
+        validated_calendar_id: str,
+        event_data: CalendarEvent
+    ) -> CalendarEvent:
+        """Create event with retry logic using validated calendar ID."""
         try:
-            self.logger.info(f"🔍 Creating Google Calendar event with ID: {calendar_id}")
-            
-            # CRITICAL FIX: Validate calendar ID before making API call
-            validated_calendar_id = await self._validate_calendar_id(calendar_id)
-            self.logger.info(f"✅ Validated calendar ID: {validated_calendar_id}")
-            
             # CRITICAL: Use custom event ID to prevent duplicates during initial sync
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
             
@@ -479,7 +488,7 @@ class GoogleCalendarService(BaseCalendarService):
             return self._format_google_event(created_event)
             
         except Exception as e:
-            self.logger.error(f"❌ Create event failed with calendar_id={calendar_id}, error: {e}")
+            self.logger.error(f"❌ Create event failed with validated_calendar_id={validated_calendar_id}, error: {e}")
             raise CalendarServiceError(f"Failed to create Google event: {e}")
     
     async def _validate_calendar_id(self, calendar_id: str) -> str:
