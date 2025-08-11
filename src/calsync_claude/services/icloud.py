@@ -284,7 +284,11 @@ class iCloudCalendarService(BaseCalendarService):
     <C:calendar-data/>
   </D:prop>
 </D:sync-collection>""",
-                        headers={"Content-Type": "application/xml; charset=utf-8"}
+                        headers={
+                            "Content-Type": "application/xml; charset=utf-8",
+                            "Depth": "1",
+                            "Prefer": "return-minimal"
+                        }
                     )
                 )
 
@@ -340,17 +344,33 @@ class iCloudCalendarService(BaseCalendarService):
             if "401" in str(e) or "unauthor" in str(e).lower():
                 raise AuthenticationError("iCloud authentication failed. Ensure an app-specific password is set.")
             if "403" in str(e) or "forbidden" in str(e).lower():
-                self.logger.error(f"🚫 iCloud Calendar Access Forbidden - Debug Info:")
-                self.logger.error(f"  Calendar URL: {calendar_id}")
-                self.logger.error(f"  Client URL: {getattr(self.client, 'url', 'Unknown')}")
-                self.logger.error(f"  Username: {self.settings.icloud_username}")
-                raise AuthenticationError(
-                    f"iCloud calendar access forbidden. This could indicate:\n"
-                    f"1. App-specific password is invalid or expired\n"
-                    f"2. Calendar permissions issue\n"
-                    f"3. Server URL mismatch\n"
-                    f"Original error: {e}"
-                )
+                # CRITICAL FIX: Handle invalid sync tokens by falling back to full sync
+                if sync_token:
+                    self.logger.warning(f"🔄 iCloud sync token invalid/expired, falling back to full sync")
+                    self.logger.warning(f"  Invalid sync token: {sync_token[:50]}..." if len(sync_token) > 50 else f"  Invalid sync token: {sync_token}")
+                    
+                    # Retry without sync token (full sync)
+                    return await self.get_change_set(
+                        calendar_id=calendar_id,
+                        time_min=time_min,
+                        time_max=time_max,
+                        max_results=max_results,
+                        updated_min=updated_min,
+                        sync_token=None  # Force full sync
+                    )
+                else:
+                    # 403 error without sync token = real auth/permission issue
+                    self.logger.error(f"🚫 iCloud Calendar Access Forbidden - Debug Info:")
+                    self.logger.error(f"  Calendar URL: {calendar_id}")
+                    self.logger.error(f"  Client URL: {getattr(self.client, 'url', 'Unknown')}")
+                    self.logger.error(f"  Username: {self.settings.icloud_username}")
+                    raise AuthenticationError(
+                        f"iCloud calendar access forbidden. This could indicate:\n"
+                        f"1. App-specific password is invalid or expired\n"
+                        f"2. Calendar permissions issue\n"
+                        f"3. Server URL mismatch\n"
+                        f"Original error: {e}"
+                    )
             if "429" in str(e) or "throttl" in str(e).lower():
                 raise CalendarServiceError(f"iCloud throttled: {e}")
             raise CalendarServiceError(f"Failed to get iCloud change set: {e}")
