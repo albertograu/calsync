@@ -462,10 +462,13 @@ class GoogleCalendarService(BaseCalendarService):
         # Check if event already exists by iCalUID to avoid 409 duplicates
         if event_data.uid:
             try:
+                self.logger.info(f"🔍 Checking for existing event with UID: {event_data.uid}")
                 existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
                 if existing_events:
-                    self.logger.info(f"📝 Event with UID {event_data.uid} already exists, updating instead")
+                    self.logger.info(f"📝 Found {len(existing_events)} existing event(s) with UID {event_data.uid}, updating first one")
                     return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
+                else:
+                    self.logger.info(f"🆕 No existing event found with UID {event_data.uid}, proceeding with create")
             except Exception as e:
                 self.logger.warning(f"Could not check for existing event, proceeding with create: {e}")
         
@@ -498,6 +501,22 @@ class GoogleCalendarService(BaseCalendarService):
             
             return self._format_google_event(created_event)
             
+        except HttpError as e:
+            if e.resp.status == 409 and "duplicate" in str(e).lower():
+                # 409 Duplicate - the event already exists, try to find and update it
+                self.logger.warning(f"🔄 409 Duplicate error, attempting to find and update existing event")
+                if event_data.uid:
+                    try:
+                        # Try a more thorough search
+                        existing_events = await self._find_events_by_uid_thorough(validated_calendar_id, event_data.uid)
+                        if existing_events:
+                            self.logger.info(f"📝 Found existing duplicate event, updating instead")
+                            return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
+                    except Exception as search_error:
+                        self.logger.error(f"Failed to find duplicate event: {search_error}")
+            
+            self.logger.error(f"❌ Create event failed with validated_calendar_id={validated_calendar_id}, error: {e}")
+            raise CalendarServiceError(f"Failed to create Google event: {e}")
         except Exception as e:
             self.logger.error(f"❌ Create event failed with validated_calendar_id={validated_calendar_id}, error: {e}")
             raise CalendarServiceError(f"Failed to create Google event: {e}")
@@ -522,11 +541,15 @@ class GoogleCalendarService(BaseCalendarService):
             
             # Filter events by iCalUID
             matching_events = []
-            for event in events:
-                if event.get('iCalUID') == uid:
-                    matching_events.append(event)
+            self.logger.debug(f"Searching through {len(events)} events for UID: {uid}")
             
-            self.logger.debug(f"Found {len(matching_events)} events with UID {uid}")
+            for event in events:
+                event_uid = event.get('iCalUID')
+                if event_uid == uid:
+                    matching_events.append(event)
+                    self.logger.debug(f"✅ Found matching event: {event.get('id')} with UID {event_uid}")
+            
+            self.logger.info(f"🔍 Search complete: Found {len(matching_events)} events with UID {uid} out of {len(events)} total events")
             return matching_events
             
         except HttpError as e:
@@ -537,6 +560,68 @@ class GoogleCalendarService(BaseCalendarService):
         except Exception as e:
             self.logger.warning(f"Failed to search for events by UID: {e}")
             return []  # Return empty instead of raising
+
+    async def _find_events_by_uid_thorough(self, calendar_id: str, uid: str) -> List[Dict[str, Any]]:
+        """More thorough search for events by iCalUID - searches more events and time ranges."""
+        try:
+            all_events = []
+            
+            # Search recent events
+            recent_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().list(
+                    calendarId=calendar_id,
+                    maxResults=500,  # Increased even more
+                    singleEvents=True,
+                    orderBy='updated'
+                ).execute()
+            )
+            all_events.extend(recent_result.get('items', []))
+            
+            # Also search upcoming events
+            from datetime import datetime, timedelta
+            import pytz
+            
+            time_min = (datetime.now(pytz.UTC) - timedelta(days=90)).isoformat()
+            time_max = (datetime.now(pytz.UTC) + timedelta(days=90)).isoformat()
+            
+            range_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().list(
+                    calendarId=calendar_id,
+                    maxResults=500,
+                    singleEvents=True,
+                    orderBy='startTime',
+                    timeMin=time_min,
+                    timeMax=time_max
+                ).execute()
+            )
+            all_events.extend(range_result.get('items', []))
+            
+            # Remove duplicates based on event ID
+            seen_ids = set()
+            unique_events = []
+            for event in all_events:
+                if event.get('id') not in seen_ids:
+                    unique_events.append(event)
+                    seen_ids.add(event.get('id'))
+            
+            # Filter by iCalUID
+            matching_events = []
+            self.logger.info(f"🔍 Thorough search: Checking {len(unique_events)} unique events for UID: {uid}")
+            
+            for event in unique_events:
+                event_uid = event.get('iCalUID')
+                if event_uid == uid:
+                    matching_events.append(event)
+                    self.logger.info(f"✅ Found matching event in thorough search: {event.get('id')} with UID {event_uid}")
+            
+            self.logger.info(f"🔍 Thorough search complete: Found {len(matching_events)} events with UID {uid}")
+            return matching_events
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to perform thorough search for events by UID: {e}")
+            return []
 
     async def _validate_calendar_id(self, calendar_id: str) -> str:
         """Validate and potentially fix calendar ID format issues.
