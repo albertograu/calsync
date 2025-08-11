@@ -495,7 +495,21 @@ class GoogleCalendarService(BaseCalendarService):
             
             # Convert event data WITH event ID generation to prevent duplicates
             # This follows Google's best practice: "generate your own unique event ID"
-            google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
+            # WORKING: Use minimal payload that Google accepts
+            google_event_data = {
+                'summary': event_data.summary or 'Untitled Event',
+                'description': event_data.description or '',
+                'location': event_data.location or '',
+                'start': {'date': event_data.start.strftime('%Y-%m-%d')} if event_data.all_day else {'dateTime': event_data.start.isoformat()},
+                'end': {'date': event_data.end.strftime('%Y-%m-%d')} if event_data.all_day else {'dateTime': event_data.end.isoformat()}
+            }
+            
+            # Add iCalUID for cross-platform matching (this was working fine)
+            if event_data.uid:
+                google_event_data['iCalUID'] = event_data.uid
+            
+            print(f"🚨 WORKING PAYLOAD: {google_event_data}")
+            print(f"🚨 TARGET CALENDAR: {validated_calendar_id}")
             
             # CRITICAL: Log the EXACT payload being sent to Google
             print(f"🚨 EXACT GOOGLE PAYLOAD:")
@@ -519,7 +533,27 @@ class GoogleCalendarService(BaseCalendarService):
                             self.logger.error(f"🚨 NON-ASCII in {key}.{subkey}: {repr(subvalue)}")
                 print(f"🚨 {key}: {value}")
             
-            # Insert with deterministic ID generated from UID to prevent duplicates
+            # Insert with deterministic ID - but check for duplicates first
+            event_id = google_event_data.get('id')
+            if event_id:
+                # Check if event already exists with this ID
+                try:
+                    existing = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.service.events().get(
+                            calendarId=validated_calendar_id,
+                            eventId=event_id
+                        ).execute()
+                    )
+                    print(f"🚨 EVENT ALREADY EXISTS: {event_id}")
+                    self.logger.error(f"🚨 EVENT ALREADY EXISTS: {event_id}")
+                    # Update instead of create
+                    return await self.update_event(validated_calendar_id, event_id, event_data)
+                except:
+                    # Event doesn't exist, safe to create
+                    pass
+            
+            # Insert with deterministic ID
             created_event = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.service.events().insert(
@@ -531,18 +565,24 @@ class GoogleCalendarService(BaseCalendarService):
             return self._format_google_event(created_event)
             
         except HttpError as e:
-            if e.resp.status == 409 and "duplicate" in str(e).lower():
-                # 409 Duplicate - should be rare with deterministic IDs, but handle it
-                self.logger.warning(f"🔄 409 Duplicate error despite deterministic ID - this indicates the event already exists")
+            if e.resp.status == 400 and "Invalid resource id value" in str(e):
+                # This is likely a duplicate ID - try to find and update existing event
+                self.logger.warning(f"🔄 Invalid resource id value - likely duplicate ID, attempting to find existing event")
                 if event_data.uid:
                     try:
-                        # Use the same compliant deterministic ID generation
-                        deterministic_id = self._generate_compliant_event_id(event_data.uid)
-                        self.logger.info(f"📝 Attempting to update existing event with compliant deterministic ID: {deterministic_id}")
+                        # Try to find existing event with same deterministic ID
+                        deterministic_id = self._generate_compliant_event_id(event_data.uid) 
+                        existing = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: self.service.events().get(
+                                calendarId=validated_calendar_id,
+                                eventId=deterministic_id
+                            ).execute()
+                        )
+                        self.logger.info(f"📝 Found existing event with same ID, updating instead")
                         return await self.update_event(validated_calendar_id, deterministic_id, event_data)
-                    except Exception as update_error:
-                        self.logger.error(f"Failed to update with deterministic ID: {update_error}")
-                        # If that fails, the event might exist with a different ID, try UID search
+                    except:
+                        # If can't find by ID, try UID search
                         try:
                             existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
                             if existing_events:
@@ -550,6 +590,21 @@ class GoogleCalendarService(BaseCalendarService):
                                 return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
                         except Exception as search_error:
                             self.logger.error(f"UID search also failed: {search_error}")
+            
+            elif e.resp.status == 409 and "duplicate" in str(e).lower():
+                # 409 Duplicate - handle same way as above
+                self.logger.warning(f"🔄 409 Duplicate error - attempting to update existing event")
+                if event_data.uid:
+                    try:
+                        deterministic_id = self._generate_compliant_event_id(event_data.uid)
+                        return await self.update_event(validated_calendar_id, deterministic_id, event_data)
+                    except:
+                        try:
+                            existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
+                            if existing_events:
+                                return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
+                        except Exception as search_error:
+                            self.logger.error(f"UID search failed: {search_error}")
             
             self.logger.error(f"❌ Create event failed with validated_calendar_id={validated_calendar_id}, error: {e}")
             raise CalendarServiceError(f"Failed to create Google event: {e}")
@@ -780,12 +835,8 @@ class GoogleCalendarService(BaseCalendarService):
         print(f"🚨 VALIDATING CALENDAR ID: {calendar_id}")
         self.logger.error(f"🚨 VALIDATING CALENDAR ID: {calendar_id}")
         
-        # CRITICAL FIX: Reject obviously malformed calendar IDs
-        # That long hex string is definitely not a valid Google Calendar ID
-        if len(calendar_id) > 100 or calendar_id.startswith('91aab076'):
-            print(f"🚨 REJECTING MALFORMED CALENDAR ID: {calendar_id}")
-            self.logger.error(f"🚨 REJECTING MALFORMED CALENDAR ID: {calendar_id}")
-            return await self._find_fallback_calendar()
+        # Skip pre-validation - let Google Calendar API validate the ID
+        # The long hex string might actually be a valid shared/group calendar ID
         
         try:
             # Simple validation: try to get calendar metadata (lightweight operation)
@@ -1076,15 +1127,12 @@ class GoogleCalendarService(BaseCalendarService):
         elif use_event_id:
             self.logger.warning(f"⚠️  Cannot generate event ID - missing UID for event: {event.summary}")
         
-        # CRITICAL FIX: Test removing iCalUID to see if that's causing the issue
-        # The iCalUID contains hyphens which might be triggering the "Invalid resource id value" error
+        # Set iCalUID for cross-platform matching (RFC5545 allows hyphens)
         if event.uid:
             clean_uid = str(event.uid).strip()
             if clean_uid:
-                # TEMPORARILY REMOVE iCalUID to test if it's causing the error
-                # google_event['iCalUID'] = clean_uid
-                print(f"🚨 TEMPORARILY REMOVING iCalUID: {clean_uid}")
-                self.logger.error(f"🚨 TEMPORARILY REMOVING iCalUID: {clean_uid}")
+                google_event['iCalUID'] = clean_uid
+                self.logger.debug(f"Set iCalUID: {clean_uid}")
             else:
                 self.logger.warning(f"Event UID is empty after cleaning: '{event.uid}'")
         
