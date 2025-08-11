@@ -459,8 +459,11 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
+            self.logger.info(f"🔍 Creating Google Calendar event with ID: {calendar_id}")
+            
             # CRITICAL FIX: Validate calendar ID before making API call
             validated_calendar_id = await self._validate_calendar_id(calendar_id)
+            self.logger.info(f"✅ Validated calendar ID: {validated_calendar_id}")
             
             # CRITICAL: Use custom event ID to prevent duplicates during initial sync
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
@@ -476,6 +479,7 @@ class GoogleCalendarService(BaseCalendarService):
             return self._format_google_event(created_event)
             
         except Exception as e:
+            self.logger.error(f"❌ Create event failed with calendar_id={calendar_id}, error: {e}")
             raise CalendarServiceError(f"Failed to create Google event: {e}")
     
     async def _validate_calendar_id(self, calendar_id: str) -> str:
@@ -490,6 +494,8 @@ class GoogleCalendarService(BaseCalendarService):
         Raises:
             CalendarServiceError: If calendar ID is invalid
         """
+        self.logger.info(f"🔍 Validating Google Calendar ID: {calendar_id}")
+        
         try:
             # Check if calendar exists by trying to get its info
             calendar_info = await asyncio.get_event_loop().run_in_executor(
@@ -497,6 +503,7 @@ class GoogleCalendarService(BaseCalendarService):
                 lambda: self.service.calendars().get(calendarId=calendar_id).execute()
             )
             
+            self.logger.info(f"✅ Calendar ID is valid: {calendar_id}")
             return calendar_id  # Calendar exists, ID is valid
             
         except HttpError as e:
