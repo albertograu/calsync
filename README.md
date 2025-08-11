@@ -465,8 +465,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - 🐛 [Report Issues](https://github.com/your-username/calsync-claude/issues)
 - 💡 [Feature Requests](https://github.com/your-username/calsync-claude/discussions)
 - 📖 [Documentation](https://github.com/your-username/calsync-claude/wiki)
-- 💬 [Community Discussions](https://github.com/your-username/calsync-claude/discussions)
-
 ---
 
 **CalSync Claude** - Powered by modern Python, designed for reliability, built for the future. 🚀
