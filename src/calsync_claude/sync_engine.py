@@ -1251,8 +1251,13 @@ class SyncEngine:
                 else:
                     # This might be a false positive - treat as normal standalone event
                     self.logger.debug(f"✅ Event {override_event.id} reclassified as standalone (not a recurrence override)")
-                
-                # In both cases, treat as standalone event to ensure it gets synced
+
+                # In both cases, strip recurrence metadata and treat as standalone event to ensure it gets synced
+                # Without this cleanup Google API will reject creation with "Invalid resource id value" when
+                # recurringEventId references a non-existent master event.
+                override_event.recurrence_overrides = []
+                override_event.recurring_event_id = None
+
                 grouped[override_event.id] = {
                     'master': override_event,
                     'overrides': []
