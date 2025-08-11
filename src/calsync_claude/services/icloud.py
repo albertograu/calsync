@@ -228,7 +228,7 @@ class iCloudCalendarService(BaseCalendarService):
                 # Use sync-collection REPORT to get deltas
                 response = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: calendar.calendar_home_set.client.request(
+                    lambda: self.client.request(
                         calendar.url,
                         "REPORT",
                         f"""<?xml version=\"1.0\" encoding=\"utf-8\" ?>
@@ -463,7 +463,7 @@ class iCloudCalendarService(BaseCalendarService):
                 raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
             await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: calendar.calendar_home_set.client.request(href, "DELETE")
+                lambda: self.client.request(href, "DELETE")
             )
         except Exception as e:
             raise CalendarServiceError(f"Failed to delete iCloud resource {href}: {e}")
@@ -764,7 +764,7 @@ class iCloudCalendarService(BaseCalendarService):
             # Execute the sync query
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: calendar.calendar_home_set.client.request(
+                lambda: self.client.request(
                     calendar.url, 
                     "REPORT", 
                     sync_query,
