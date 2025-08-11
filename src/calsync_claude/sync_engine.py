@@ -733,6 +733,11 @@ class SyncEngine:
                         target_calendar_id, source_event
                     )
                     
+                    # Extract calendar mapping values before new session to avoid DetachedInstanceError
+                    calendar_mapping_id = calendar_mapping.id
+                    google_calendar_id = calendar_mapping.google_calendar_id
+                    icloud_calendar_id = calendar_mapping.icloud_calendar_id
+                    
                     # Create mapping with all necessary fields for production
                     with self.db_manager.get_session() as session:
                         if source_event.source == EventSource.GOOGLE:
@@ -742,11 +747,11 @@ class SyncEngine:
                                 icloud_resource_url = created_event.original_data.get('resource_url')
                             
                             mapping = EventMappingDB(
-                                calendar_mapping_id=calendar_mapping.id,
+                                calendar_mapping_id=calendar_mapping_id,
                                 google_event_id=source_event.id,
                                 icloud_event_id=created_event.id,
-                                google_calendar_id=calendar_mapping.google_calendar_id,
-                                icloud_calendar_id=calendar_mapping.icloud_calendar_id,
+                                google_calendar_id=google_calendar_id,
+                                icloud_calendar_id=icloud_calendar_id,
                                 
                                 # UIDs for cross-platform matching (CRITICAL)
                                 google_ical_uid=source_event.uid,
@@ -775,11 +780,11 @@ class SyncEngine:
                                 google_self_link = created_event.original_data.get('selfLink')
                                 
                             mapping = EventMappingDB(
-                                calendar_mapping_id=calendar_mapping.id,
+                                calendar_mapping_id=calendar_mapping_id,
                                 google_event_id=created_event.id,
                                 icloud_event_id=source_event.id,
-                                google_calendar_id=calendar_mapping.google_calendar_id,
-                                icloud_calendar_id=calendar_mapping.icloud_calendar_id,
+                                google_calendar_id=google_calendar_id,
+                                icloud_calendar_id=icloud_calendar_id,
                                 
                                 # UIDs for cross-platform matching (CRITICAL)
                                 google_ical_uid=created_event.uid,

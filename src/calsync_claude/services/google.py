@@ -450,18 +450,26 @@ class GoogleCalendarService(BaseCalendarService):
         calendar_id: str,
         event_data: CalendarEvent
     ) -> CalendarEvent:
-        """Create a new Google Calendar event."""
-        print(f"🚨 CREATE EVENT CALLED WITH ID: {calendar_id}")
-        self.logger.critical(f"🚨 CREATE EVENT CALLED WITH ID: {calendar_id}")
+        """Create a new Google Calendar event, or update if it already exists."""
         self._ensure_authenticated()
         
-        self.logger.info(f"🔍 Creating Google Calendar event with ID: {calendar_id}")
+        self.logger.info(f"🔍 Creating Google Calendar event: {event_data.summary}")
         
-        # CRITICAL FIX: Validate calendar ID BEFORE retry loop
+        # Validate calendar ID first
         validated_calendar_id = await self._validate_calendar_id(calendar_id)
-        self.logger.info(f"✅ Validated calendar ID: {validated_calendar_id}")
+        self.logger.info(f"✅ Using validated calendar ID: {validated_calendar_id}")
         
-        # Now do the actual creation with retry using the validated ID
+        # Check if event already exists by iCalUID to avoid 409 duplicates
+        if event_data.uid:
+            try:
+                existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
+                if existing_events:
+                    self.logger.info(f"📝 Event with UID {event_data.uid} already exists, updating instead")
+                    return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
+            except Exception as e:
+                self.logger.warning(f"Could not check for existing event, proceeding with create: {e}")
+        
+        # Proceed with creation using the validated ID
         return await self._create_event_with_retry(validated_calendar_id, event_data)
     
     # @retry(
@@ -479,9 +487,6 @@ class GoogleCalendarService(BaseCalendarService):
             # Convert event data without any ID manipulation - let Google handle IDs
             google_event_data = self._convert_to_google_format(event_data, use_event_id=False)
             
-            print(f"🚨 REAL EVENT DATA: {google_event_data}")
-            self.logger.critical(f"🚨 REAL EVENT DATA: {google_event_data}")
-            
             # Simple insert without ID parameter - Google generates ID automatically
             created_event = await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -497,6 +502,28 @@ class GoogleCalendarService(BaseCalendarService):
             self.logger.error(f"❌ Create event failed with validated_calendar_id={validated_calendar_id}, error: {e}")
             raise CalendarServiceError(f"Failed to create Google event: {e}")
     
+    async def _find_events_by_uid(self, calendar_id: str, uid: str) -> List[Dict[str, Any]]:
+        """Find events in Google Calendar by iCalUID."""
+        try:
+            # Search for events with this iCalUID
+            events = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().list(
+                    calendarId=calendar_id,
+                    iCalUID=uid,
+                    maxResults=10
+                ).execute()
+            )
+            
+            return events.get('items', [])
+            
+        except HttpError as e:
+            if e.resp.status == 404:
+                return []  # Calendar not found, no events
+            raise CalendarServiceError(f"Failed to search for events by UID: {e}")
+        except Exception as e:
+            raise CalendarServiceError(f"Failed to search for events by UID: {e}")
+
     async def _validate_calendar_id(self, calendar_id: str) -> str:
         """Validate and potentially fix calendar ID format issues.
         
@@ -509,13 +536,9 @@ class GoogleCalendarService(BaseCalendarService):
         Raises:
             CalendarServiceError: If calendar ID is invalid
         """
-        print(f"🚨 VALIDATION METHOD CALLED WITH ID: {calendar_id}")
-        self.logger.critical(f"🚨 VALIDATION METHOD CALLED WITH ID: {calendar_id}")
-        self.logger.info(f"🔍 Validating Google Calendar ID: {calendar_id}")
+        self.logger.debug(f"🔍 Validating Google Calendar ID: {calendar_id}")
         
         try:
-            print("🚨 TESTING EVENT CREATION CAPABILITY")
-            self.logger.critical("🚨 TESTING EVENT CREATION CAPABILITY")
             
             # Test if calendar supports event creation by doing a dry run
             # Create a minimal test event to check permissions
@@ -552,14 +575,10 @@ class GoogleCalendarService(BaseCalendarService):
             except:
                 pass  # Ignore cleanup errors
             
-            print(f"🚨 EVENT CREATION TEST SUCCEEDED: {calendar_id}")
-            self.logger.critical(f"🚨 EVENT CREATION TEST SUCCEEDED: {calendar_id}")
-            self.logger.info(f"✅ Calendar ID supports event creation: {calendar_id}")
+            self.logger.debug(f"✅ Calendar ID supports event creation: {calendar_id}")
             return calendar_id  # Calendar supports event creation
             
         except HttpError as e:
-            print(f"🚨 HTTP ERROR IN VALIDATION: {e}")
-            self.logger.critical(f"🚨 HTTP ERROR IN VALIDATION: {e}")
             
             # Check for invalid calendar ID (400 error) or not found (404)
             if e.resp.status == 400 and "Invalid resource id value" in str(e):
