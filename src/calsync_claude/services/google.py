@@ -510,62 +510,96 @@ class GoogleCalendarService(BaseCalendarService):
         self.logger.info(f"🔍 Validating Google Calendar ID: {calendar_id}")
         
         try:
-            print("🚨 ABOUT TO CHECK CALENDAR EXISTS")
-            self.logger.critical("🚨 ABOUT TO CHECK CALENDAR EXISTS")
+            print("🚨 TESTING EVENT CREATION CAPABILITY")
+            self.logger.critical("🚨 TESTING EVENT CREATION CAPABILITY")
             
-            # Check if calendar exists by trying to get its info
-            calendar_info = await asyncio.get_event_loop().run_in_executor(
+            # Test if calendar supports event creation by doing a dry run
+            # Create a minimal test event to check permissions
+            test_event = {
+                'summary': 'CalSync Test Event (will be deleted)',
+                'start': {
+                    'dateTime': '2099-01-01T12:00:00Z',
+                    'timeZone': 'UTC'
+                },
+                'end': {
+                    'dateTime': '2099-01-01T13:00:00Z', 
+                    'timeZone': 'UTC'
+                }
+            }
+            
+            # Try to create a test event to validate the calendar can accept events
+            test_result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.service.calendars().get(calendarId=calendar_id).execute()
+                lambda: self.service.events().insert(
+                    calendarId=calendar_id,
+                    body=test_event
+                ).execute()
             )
             
-            print(f"🚨 CALENDAR CHECK SUCCEEDED: {calendar_id}")
-            self.logger.critical(f"🚨 CALENDAR CHECK SUCCEEDED: {calendar_id}")
-            self.logger.info(f"✅ Calendar ID is valid: {calendar_id}")
-            return calendar_id  # Calendar exists, ID is valid
+            # Clean up test event immediately
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.service.events().delete(
+                        calendarId=calendar_id,
+                        eventId=test_result['id']
+                    ).execute()
+                )
+            except:
+                pass  # Ignore cleanup errors
+            
+            print(f"🚨 EVENT CREATION TEST SUCCEEDED: {calendar_id}")
+            self.logger.critical(f"🚨 EVENT CREATION TEST SUCCEEDED: {calendar_id}")
+            self.logger.info(f"✅ Calendar ID supports event creation: {calendar_id}")
+            return calendar_id  # Calendar supports event creation
             
         except HttpError as e:
             print(f"🚨 HTTP ERROR IN VALIDATION: {e}")
             self.logger.critical(f"🚨 HTTP ERROR IN VALIDATION: {e}")
-            if e.resp.status == 404:
-                # Calendar not found - try common fixes
+            
+            # Check for invalid calendar ID (400 error) or not found (404)
+            if e.resp.status == 400 and "Invalid resource id value" in str(e):
+                print(f"📋 Google Calendar ID invalid for event creation: {calendar_id}")
+                self.logger.critical(f"📋 Google Calendar ID invalid for event creation: {calendar_id}")
+                self.logger.warning(f"📋 Google Calendar ID invalid for event creation: {calendar_id}")
+            elif e.resp.status == 404:
                 print(f"📋 Google Calendar ID not found: {calendar_id}")
                 self.logger.critical(f"📋 Google Calendar ID not found: {calendar_id}")
                 self.logger.warning(f"📋 Google Calendar ID not found: {calendar_id}")
-                
-                # Try to find the correct calendar ID by listing all calendars
-                try:
-                    calendar_list = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: self.service.calendarList().list().execute()
-                    )
-                    
-                    # Look for primary calendar
-                    for calendar_item in calendar_list.get('items', []):
-                        if calendar_item.get('primary', False):
-                            primary_id = calendar_item['id']
-                            print(f"🔧 Using primary calendar instead: {primary_id}")
-                            self.logger.critical(f"🔧 Using primary calendar instead: {primary_id}")
-                            self.logger.warning(f"🔧 Using primary calendar instead: {primary_id}")
-                            return primary_id
-                    
-                    # Fallback to 'primary'
-                    print(f"🔧 Using 'primary' as fallback")
-                    self.logger.critical(f"🔧 Using 'primary' as fallback")
-                    self.logger.warning(f"🔧 Using 'primary' as fallback")
-                    return 'primary'
-                    
-                except Exception as list_error:
-                    print(f"Failed to list Google calendars: {list_error}")
-                    self.logger.critical(f"Failed to list Google calendars: {list_error}")
-                    self.logger.error(f"Failed to list Google calendars: {list_error}")
-                    # Final fallback
-                    return 'primary'
             else:
-                # Other HTTP error, re-raise
                 print(f"🚨 OTHER HTTP ERROR: {e}")
                 self.logger.critical(f"🚨 OTHER HTTP ERROR: {e}")
+                # Re-raise unknown errors
                 raise CalendarServiceError(f"Calendar ID validation failed: {e}")
+            
+            # For both 400 and 404 errors, try to find the primary calendar
+            try:
+                calendar_list = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.service.calendarList().list().execute()
+                )
+                
+                # Look for primary calendar
+                for calendar_item in calendar_list.get('items', []):
+                    if calendar_item.get('primary', False):
+                        primary_id = calendar_item['id']
+                        print(f"🔧 Using primary calendar instead: {primary_id}")
+                        self.logger.critical(f"🔧 Using primary calendar instead: {primary_id}")
+                        self.logger.warning(f"🔧 Using primary calendar instead: {primary_id}")
+                        return primary_id
+                
+                # Fallback to 'primary'
+                print(f"🔧 Using 'primary' as fallback")
+                self.logger.critical(f"🔧 Using 'primary' as fallback")
+                self.logger.warning(f"🔧 Using 'primary' as fallback")
+                return 'primary'
+                
+            except Exception as list_error:
+                print(f"Failed to list Google calendars: {list_error}")
+                self.logger.critical(f"Failed to list Google calendars: {list_error}")
+                self.logger.error(f"Failed to list Google calendars: {list_error}")
+                # Final fallback
+                return 'primary'
         except Exception as e:
             print(f"🚨 UNEXPECTED ERROR IN VALIDATION: {e}")
             self.logger.critical(f"🚨 UNEXPECTED ERROR IN VALIDATION: {e}")
