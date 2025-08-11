@@ -177,7 +177,7 @@ class Settings(BaseSettings):
             return v
         # App-specific passwords are 16 characters, groups of 4 separated by dashes
         import re
-        if not re.match(r'^[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}$', v.lower()):
+        if not re.match(r'^[a-zA-Z]{4}-[a-zA-Z]{4}-[a-zA-Z]{4}-[a-zA-Z]{4}$', v):
             raise ValueError("iCloud password should be an app-specific password (format: xxxx-xxxx-xxxx-xxxx)")
         return v
     

@@ -51,15 +51,23 @@ class iCloudCalendarService(BaseCalendarService):
             
             # CRITICAL FIX: Update client URL to match the server-specific URL
             # iCloud redirects from caldav.icloud.com to server-specific URLs like p65-caldav.icloud.com
+            self.logger.info(f"🔍 iCloud Authentication Debug:")
+            self.logger.info(f"  Initial server URL: {self.settings.icloud_server_url}")
+            self.logger.info(f"  Principal object: {self.principal}")
+            self.logger.info(f"  Principal has URL: {hasattr(self.principal, 'url')}")
+            
             if hasattr(self.principal, 'url') and self.principal.url:
                 principal_url = str(self.principal.url)
+                self.logger.info(f"  Principal URL: {principal_url}")
+                
                 # Extract the base URL (protocol + hostname + port)
                 parsed_url = urlparse(principal_url)
                 server_base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                self.logger.info(f"  Extracted server base URL: {server_base_url}")
                 
                 # Update client to use server-specific URL
                 if server_base_url != self.settings.icloud_server_url:
-                    self.logger.info(f"Updating iCloud CalDAV URL from {self.settings.icloud_server_url} to {server_base_url}")
+                    self.logger.info(f"🔧 Updating iCloud CalDAV URL from {self.settings.icloud_server_url} to {server_base_url}")
                     self.client = await asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: DAVClient(
@@ -73,9 +81,14 @@ class iCloudCalendarService(BaseCalendarService):
                         None,
                         lambda: self.client.principal()
                     )
+                    self.logger.info(f"✅ Successfully updated client to use {server_base_url}")
+                else:
+                    self.logger.info(f"📍 Server URL unchanged: {server_base_url}")
+            else:
+                self.logger.warning("❌ Principal has no URL attribute - server URL detection failed")
             
             self._authenticated = True
-            self.logger.info("Successfully authenticated with iCloud CalDAV")
+            self.logger.info("✅ Successfully authenticated with iCloud CalDAV")
             
         except Exception as e:
             raise AuthenticationError(f"iCloud CalDAV authentication failed: {e}")
@@ -251,6 +264,12 @@ class iCloudCalendarService(BaseCalendarService):
 
             if sync_token:
                 # Use sync-collection REPORT to get deltas
+                self.logger.info(f"🔍 Making sync-collection request:")
+                self.logger.info(f"  Calendar ID: {calendar_id}")
+                self.logger.info(f"  Calendar URL: {calendar.url if calendar else 'None'}")
+                self.logger.info(f"  Client URL: {getattr(self.client, 'url', 'Unknown')}")
+                self.logger.info(f"  Sync token: {sync_token[:50]}..." if sync_token else "  No sync token")
+                
                 response = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: self.client.request(
@@ -320,6 +339,18 @@ class iCloudCalendarService(BaseCalendarService):
         except Exception as e:
             if "401" in str(e) or "unauthor" in str(e).lower():
                 raise AuthenticationError("iCloud authentication failed. Ensure an app-specific password is set.")
+            if "403" in str(e) or "forbidden" in str(e).lower():
+                self.logger.error(f"🚫 iCloud Calendar Access Forbidden - Debug Info:")
+                self.logger.error(f"  Calendar URL: {calendar_id}")
+                self.logger.error(f"  Client URL: {getattr(self.client, 'url', 'Unknown')}")
+                self.logger.error(f"  Username: {self.settings.icloud_username}")
+                raise AuthenticationError(
+                    f"iCloud calendar access forbidden. This could indicate:\n"
+                    f"1. App-specific password is invalid or expired\n"
+                    f"2. Calendar permissions issue\n"
+                    f"3. Server URL mismatch\n"
+                    f"Original error: {e}"
+                )
             if "429" in str(e) or "throttl" in str(e).lower():
                 raise CalendarServiceError(f"iCloud throttled: {e}")
             raise CalendarServiceError(f"Failed to get iCloud change set: {e}")
