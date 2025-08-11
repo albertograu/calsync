@@ -676,50 +676,63 @@ class GoogleCalendarService(BaseCalendarService):
             return []
 
     def _generate_compliant_event_id(self, uid: str) -> str:
-        """Generate Google Calendar compliant event ID from UID.
+        """Generate Google Calendar compliant event ID from UID using proper base32hex.
         
         Google Calendar event IDs must:
-        - Use base32hex encoding: only lowercase letters a-v and digits 0-9
+        - Use base32hex encoding: only lowercase letters a-v and digits 0-9 (RFC2938)
         - Be between 5 and 1024 characters long
+        
+        This implementation uses proper base32hex encoding as specified in RFC2938.
         """
         import hashlib
-        import base64
         
         # Create hash from UID
         hash_bytes = hashlib.sha256(uid.encode()).digest()
         
-        # Convert to base32 and make it Google Calendar compliant
-        base32_id = base64.b32encode(hash_bytes).decode().lower()
+        # Use proper base32hex encoding (RFC2938) - alphabet is 0123456789abcdefghijklmnopqrstuv
+        # This is different from standard base32 which uses A-Z234567
+        base32hex_alphabet = '0123456789abcdefghijklmnopqrstuv'
         
-        # Replace characters outside a-v range to make it compliant
-        # Map w-z to a-d to stay within a-v range
-        compliant_id = ""
-        for char in base32_id:
-            if char in 'wxyz':
-                # Map w->a, x->b, y->c, z->d
-                compliant_id += chr(ord('a') + ord(char) - ord('w'))
-            elif char.isalnum() and 'a' <= char <= 'v':
-                compliant_id += char
-            elif char.isdigit():
-                compliant_id += char
-            # Skip padding characters (=) and other invalid chars
+        # Manual base32hex encoding to ensure compliance
+        def base32hex_encode(data: bytes) -> str:
+            """Encode bytes using base32hex alphabet (RFC2938)."""
+            bits = ''.join(format(byte, '08b') for byte in data)
+            # Pad to multiple of 5 bits
+            while len(bits) % 5 != 0:
+                bits += '0'
+            
+            result = ''
+            for i in range(0, len(bits), 5):
+                chunk = bits[i:i+5]
+                result += base32hex_alphabet[int(chunk, 2)]
+            
+            return result
         
-        # Ensure length is between 5 and 32 (reasonable limit)
-        event_id = compliant_id[:32] if len(compliant_id) >= 5 else (compliant_id + '0' * (5 - len(compliant_id)))
+        # Generate the base32hex encoded ID
+        event_id = base32hex_encode(hash_bytes)
+        
+        # Truncate to reasonable length (32 chars max for readability)
+        if len(event_id) > 32:
+            event_id = event_id[:32]
+        elif len(event_id) < 5:
+            # Pad with '0' if too short (should not happen with SHA256)
+            event_id = event_id + '0' * (5 - len(event_id))
         
         # Debug logging - show the transformation process
         self.logger.info(f"🔧 ID generation for UID '{uid}':")
-        self.logger.info(f"   → Base32: '{base32_id}' (length: {len(base32_id)})")
-        self.logger.info(f"   → Compliant: '{compliant_id}' (length: {len(compliant_id)})")
-        self.logger.info(f"   → Final: '{event_id}' (length: {len(event_id)})")
+        self.logger.info(f"   → Hash bytes: {hash_bytes.hex()}")
+        self.logger.info(f"   → Base32hex: '{event_id}' (length: {len(event_id)})")
         
-        # Validate the final result
-        if len(event_id) < 5 or len(event_id) > 32:
+        # Validate the final result against Google's requirements
+        if len(event_id) < 5 or len(event_id) > 1024:
             self.logger.error(f"❌ Generated invalid length event ID: '{event_id}' (length: {len(event_id)}) for UID: {uid}")
         
-        invalid_chars = [c for c in event_id if not (c.isdigit() or 'a' <= c <= 'v')]
+        # Check that all characters are in the valid base32hex alphabet
+        invalid_chars = [c for c in event_id if c not in base32hex_alphabet]
         if invalid_chars:
             self.logger.error(f"❌ Generated event ID contains invalid characters: {invalid_chars} in ID: '{event_id}'")
+        else:
+            self.logger.info(f"✅ Generated valid base32hex event ID: '{event_id}' for UID: {uid}")
         
         return event_id
 

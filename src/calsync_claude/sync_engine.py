@@ -1236,14 +1236,73 @@ class SyncEngine:
             if master_id and master_id in grouped:
                 grouped[master_id]['overrides'].append(override_event)
             else:
-                # Orphaned override - treat as standalone event
-                self.logger.warning(f"Orphaned recurrence override event: {override_event.id}")
+                # Orphaned override - investigate and handle appropriately
+                self.logger.debug(f"🔍 Investigating orphaned recurrence override: {override_event.id}")
+                
+                # Check if this might be a legitimate standalone event that was misidentified
+                is_likely_override = self._validate_recurrence_override(override_event)
+                
+                if is_likely_override:
+                    # This is likely a true orphaned override - log it but treat as standalone
+                    self.logger.warning(f"Orphaned recurrence override event: {override_event.id}")
+                    self.logger.debug(f"  → UID: {override_event.uid}")
+                    self.logger.debug(f"  → Summary: {override_event.summary}")
+                    self.logger.debug(f"  → Expected master ID: {master_id}")
+                else:
+                    # This might be a false positive - treat as normal standalone event
+                    self.logger.debug(f"✅ Event {override_event.id} reclassified as standalone (not a recurrence override)")
+                
+                # In both cases, treat as standalone event to ensure it gets synced
                 grouped[override_event.id] = {
                     'master': override_event,
                     'overrides': []
                 }
         
         return grouped
+    
+    def _validate_recurrence_override(self, event: CalendarEvent) -> bool:
+        """Validate if an event is truly a recurrence override or a false positive.
+        
+        Args:
+            event: Event to validate
+            
+        Returns:
+            True if this is likely a genuine recurrence override, False if it might be a standalone event
+        """
+        # Check for strong indicators of recurrence overrides
+        strong_indicators = 0
+        
+        # 1. Has recurrence-id in recurrence_overrides
+        if event.recurrence_overrides:
+            for override in event.recurrence_overrides:
+                if override.get('type') == 'recurrence-id':
+                    strong_indicators += 2  # Strong indicator
+        
+        # 2. Google Calendar recurring_event_id
+        if hasattr(event, 'recurring_event_id') and event.recurring_event_id:
+            strong_indicators += 2  # Strong indicator
+        
+        # 3. Event summary contains recurrence-like patterns
+        summary = event.summary.lower()
+        if any(pattern in summary for pattern in ['(exception)', '(modified)', '(moved)', '(cancelled)']):
+            strong_indicators += 1
+        
+        # 4. Check for typical recurrence override patterns in description
+        if event.description:
+            desc = event.description.lower()
+            if any(pattern in desc for pattern in ['this instance', 'occurrence', 'exception', 'modified from series']):
+                strong_indicators += 1
+        
+        # If we have strong indicators, it's likely a true override
+        if strong_indicators >= 2:
+            return True
+        
+        # If it has some indicators but not strong ones, it might be a false positive
+        # This could happen with events that have similar patterns but aren't actual overrides
+        if strong_indicators == 1:
+            self.logger.debug(f"🤔 Weak recurrence override indicators for {event.id}: {strong_indicators}")
+        
+        return False
     
     def _is_recurrence_override(self, event: CalendarEvent) -> bool:
         """Check if an event is a recurrence override.
