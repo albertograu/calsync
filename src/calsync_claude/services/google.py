@@ -706,6 +706,21 @@ class GoogleCalendarService(BaseCalendarService):
         
         # Ensure length is between 5 and 32 (reasonable limit)
         event_id = compliant_id[:32] if len(compliant_id) >= 5 else (compliant_id + '0' * (5 - len(compliant_id)))
+        
+        # Debug logging - show the transformation process
+        self.logger.info(f"🔧 ID generation for UID '{uid}':")
+        self.logger.info(f"   → Base32: '{base32_id}' (length: {len(base32_id)})")
+        self.logger.info(f"   → Compliant: '{compliant_id}' (length: {len(compliant_id)})")
+        self.logger.info(f"   → Final: '{event_id}' (length: {len(event_id)})")
+        
+        # Validate the final result
+        if len(event_id) < 5 or len(event_id) > 32:
+            self.logger.error(f"❌ Generated invalid length event ID: '{event_id}' (length: {len(event_id)}) for UID: {uid}")
+        
+        invalid_chars = [c for c in event_id if not (c.isdigit() or 'a' <= c <= 'v')]
+        if invalid_chars:
+            self.logger.error(f"❌ Generated event ID contains invalid characters: {invalid_chars} in ID: '{event_id}'")
+        
         return event_id
 
     async def _validate_calendar_id(self, calendar_id: str) -> str:
@@ -1007,6 +1022,7 @@ class GoogleCalendarService(BaseCalendarService):
         if use_event_id and event.uid:
             # Generate Google Calendar compliant ID from UID
             event_id = self._generate_compliant_event_id(event.uid)
+            self.logger.info(f"🔧 Generated event ID '{event_id}' (length: {len(event_id)}) for UID: {event.uid}")
             google_event['id'] = event_id
         
         # Set iCalUID for cross-platform matching
