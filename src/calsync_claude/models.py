@@ -346,3 +346,4 @@ class ChangeSet(Generic[T]):
     deleted_native_ids: Set[str]
     next_sync_token: Optional[str]
     used_sync_token: bool
+    invalid_token_used: Optional[str] = None

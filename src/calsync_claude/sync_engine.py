@@ -453,6 +453,14 @@ class SyncEngine:
         icloud_events = dict(i_cs.changed)
         icloud_deleted_raw = set(i_cs.deleted_native_ids)
         new_icloud_sync_token = i_cs.next_sync_token
+        
+        # Check if we need to clear an invalid sync token
+        if hasattr(i_cs, 'invalid_token_used') and i_cs.invalid_token_used:
+            self.logger.warning(f"🧹 Clearing invalid iCloud sync token from database: {i_cs.invalid_token_used}")
+            calendar_mapping.icloud_sync_token = None
+            with self.db_manager.get_session() as session:
+                session.merge(calendar_mapping)
+                session.commit()
         for ev in icloud_events.values():
             if ev.uid:
                 icloud_events_by_uid[ev.uid] = ev
@@ -804,7 +812,23 @@ class SyncEngine:
                 )
                 
         except Exception as e:
-            self.logger.error(f"Failed to sync event {source_event.id}: {e}")
+            # Enhanced error logging to see actual root cause
+            error_details = str(e)
+            error_type = type(e).__name__
+            
+            # Unwrap RetryError to get the real error
+            if "RetryError" in error_type and hasattr(e, 'last_attempt') and e.last_attempt:
+                try:
+                    real_error = e.last_attempt.exception()
+                    if real_error:
+                        error_details = f"{type(real_error).__name__}: {str(real_error)}"
+                        error_type = type(real_error).__name__
+                except:
+                    pass
+            
+            self.logger.error(f"❌ Failed to sync event {source_event.id}: {error_type}: {error_details}")
+            self.logger.error(f"   📝 Event: '{source_event.summary}' ({source_event.source.value} → {target_source.value})")
+            
             await self._record_sync_operation(
                 sync_session, sync_report, SyncOperation.CREATE if not mapping else SyncOperation.UPDATE,
                 source_event.source, target_source, source_event.id,

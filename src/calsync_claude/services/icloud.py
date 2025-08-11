@@ -350,7 +350,7 @@ class iCloudCalendarService(BaseCalendarService):
                     self.logger.warning(f"  Invalid sync token: {sync_token[:50]}..." if len(sync_token) > 50 else f"  Invalid sync token: {sync_token}")
                     
                     # Retry without sync token (full sync)
-                    return await self.get_change_set(
+                    result = await self.get_change_set(
                         calendar_id=calendar_id,
                         time_min=time_min,
                         time_max=time_max,
@@ -358,6 +358,11 @@ class iCloudCalendarService(BaseCalendarService):
                         updated_min=updated_min,
                         sync_token=None  # Force full sync
                     )
+                    
+                    # CRITICAL: Mark the invalid token for database cleanup
+                    result.invalid_token_used = sync_token
+                    
+                    return result
                 else:
                     # 403 error without sync token = real auth/permission issue
                     self.logger.error(f"🚫 iCloud Calendar Access Forbidden - Debug Info:")
