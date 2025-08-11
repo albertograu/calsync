@@ -451,6 +451,8 @@ class GoogleCalendarService(BaseCalendarService):
         event_data: CalendarEvent
     ) -> CalendarEvent:
         """Create a new Google Calendar event."""
+        print(f"🚨 CREATE EVENT CALLED WITH ID: {calendar_id}")
+        self.logger.critical(f"🚨 CREATE EVENT CALLED WITH ID: {calendar_id}")
         self._ensure_authenticated()
         
         self.logger.info(f"🔍 Creating Google Calendar event with ID: {calendar_id}")
@@ -503,6 +505,8 @@ class GoogleCalendarService(BaseCalendarService):
         Raises:
             CalendarServiceError: If calendar ID is invalid
         """
+        print(f"🚨 VALIDATION METHOD CALLED WITH ID: {calendar_id}")
+        self.logger.critical(f"🚨 VALIDATION METHOD CALLED WITH ID: {calendar_id}")
         self.logger.info(f"🔍 Validating Google Calendar ID: {calendar_id}")
         
         try:
