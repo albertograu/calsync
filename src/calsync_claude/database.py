@@ -701,7 +701,7 @@ class DatabaseManager:
         event_summary: Optional[str] = None,
         success: bool = True,
         error_message: Optional[str] = None,
-        event_mapping: Optional[EventMappingDB] = None
+        event_mapping_id: Optional[str] = None
     ) -> SyncOperationDB:
         """Create sync operation record.
         
@@ -715,14 +715,14 @@ class DatabaseManager:
             event_summary: Event summary
             success: Whether operation succeeded
             error_message: Error message if failed
-            event_mapping: Associated event mapping
+            event_mapping_id: Associated event mapping ID
             
         Returns:
             Created sync operation
         """
         sync_op = SyncOperationDB(
             sync_session_id=sync_session.id,
-            event_mapping_id=event_mapping.id if event_mapping else None,
+            event_mapping_id=event_mapping_id,
             operation=operation,
             source=source,
             target=target,

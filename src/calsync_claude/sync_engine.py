@@ -1104,7 +1104,8 @@ class SyncEngine:
         event_summary: str,
         success: bool,
         error: Optional[str] = None,
-        mapping: Optional[EventMappingDB] = None
+        mapping: Optional[EventMappingDB] = None,
+        mapping_id: Optional[str] = None
     ) -> None:
         """Record sync operation in database and report.
         
@@ -1142,10 +1143,19 @@ class SyncEngine:
         
         # Record in database
         with self.db_manager.get_session() as session:
+            # Use mapping_id if provided, otherwise try to extract from mapping object
+            event_mapping_id = mapping_id
+            if event_mapping_id is None and mapping is not None:
+                try:
+                    event_mapping_id = mapping.id
+                except Exception:
+                    # Mapping is detached, skip mapping ID
+                    event_mapping_id = None
+            
             self.db_manager.create_sync_operation(
                 session, sync_session,
                 operation.value, source.value, target.value,
-                event_id, event_summary, success, error, mapping
+                event_id, event_summary, success, error, event_mapping_id
             )
     
     async def get_sync_status(self) -> Dict[str, Any]:

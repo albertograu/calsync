@@ -505,24 +505,38 @@ class GoogleCalendarService(BaseCalendarService):
     async def _find_events_by_uid(self, calendar_id: str, uid: str) -> List[Dict[str, Any]]:
         """Find events in Google Calendar by iCalUID."""
         try:
-            # Search for events with this iCalUID
-            events = await asyncio.get_event_loop().run_in_executor(
+            # Google Calendar API doesn't reliably support iCalUID parameter in list()
+            # Instead, we need to search through events and filter manually
+            # Get recent events and search through them
+            events_result = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.service.events().list(
                     calendarId=calendar_id,
-                    iCalUID=uid,
-                    maxResults=10
+                    maxResults=250,  # Increased to catch more events
+                    singleEvents=True,
+                    orderBy='updated'
                 ).execute()
             )
             
-            return events.get('items', [])
+            events = events_result.get('items', [])
+            
+            # Filter events by iCalUID
+            matching_events = []
+            for event in events:
+                if event.get('iCalUID') == uid:
+                    matching_events.append(event)
+            
+            self.logger.debug(f"Found {len(matching_events)} events with UID {uid}")
+            return matching_events
             
         except HttpError as e:
             if e.resp.status == 404:
                 return []  # Calendar not found, no events
-            raise CalendarServiceError(f"Failed to search for events by UID: {e}")
+            self.logger.warning(f"Failed to search for events by UID: {e}")
+            return []  # Return empty instead of raising
         except Exception as e:
-            raise CalendarServiceError(f"Failed to search for events by UID: {e}")
+            self.logger.warning(f"Failed to search for events by UID: {e}")
+            return []  # Return empty instead of raising
 
     async def _validate_calendar_id(self, calendar_id: str) -> str:
         """Validate and potentially fix calendar ID format issues.
@@ -640,7 +654,21 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
+            # First, fetch the current event to get the latest sequence number
+            current_event = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().get(
+                    calendarId=calendar_id,
+                    eventId=event_id
+                ).execute()
+            )
+            
             google_event_data = self._convert_to_google_format(event_data)
+            
+            # Use the current sequence number from the existing event
+            # This prevents "Invalid sequence value" errors
+            if 'sequence' in current_event:
+                google_event_data['sequence'] = current_event['sequence']
             
             updated_event = await asyncio.get_event_loop().run_in_executor(
                 None,
