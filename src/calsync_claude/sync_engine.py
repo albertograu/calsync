@@ -611,6 +611,27 @@ class SyncEngine:
                 for override_event in override_events:
                     if override_event.id not in processed_icloud:
                         if override_event.should_sync_to_calendar(google_calendar_id, google_events):
+                            # Ensure Google recurringEventId points to the Google master ID if possible
+                            try:
+                                if override_event.uid:
+                                    # Determine deterministic Google master ID from UID
+                                    master_google_id = self.google_service._generate_compliant_event_id(override_event.uid)
+                                    # If the master exists in target by UID, prefer its actual ID
+                                    existing_master = None
+                                    if target_events_by_uid and override_event.uid in target_events_by_uid:
+                                        existing_master = target_events_by_uid[override_event.uid]
+                                    if existing_master:
+                                        # Use actual Google master id
+                                        for ov in override_event.recurrence_overrides:
+                                            if ov.get('type') == 'recurrence-id' and ov.get('is_override'):
+                                                ov['master_event_id'] = existing_master.id
+                                    else:
+                                        # Use deterministic ID as best effort
+                                        for ov in override_event.recurrence_overrides:
+                                            if ov.get('type') == 'recurrence-id' and ov.get('is_override'):
+                                                ov['master_event_id'] = master_google_id
+                            except Exception:
+                                pass
                             await self._sync_event_to_target(
                                 override_event, EventSource.GOOGLE, google_calendar_id,
                                 calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run,

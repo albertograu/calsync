@@ -676,21 +676,23 @@ class GoogleCalendarService(BaseCalendarService):
             return []
 
     def _generate_compliant_event_id(self, uid: str) -> str:
-        """Generate Google Calendar compliant event ID from UID using proper base32hex.
-        
-        Google Calendar event IDs must:
-        - Use base32hex encoding: only lowercase letters a-v and digits 0-9 (RFC2938)
-        - Be between 5 and 1024 characters long
-        
-        This implementation uses proper base32hex encoding as specified in RFC2938.
+        """Generate a Google Calendar-compliant event ID from a UID.
+
+        Per Google Calendar API (Events resource), event.id must match:
+        - characters: [a-z0-9_\-]
+        - length: 5..1024
+        - recommend client-supplied stable IDs to avoid duplicates
+
+        We'll derive a stable identifier using SHA-256 and a safe alphabet, then
+        prefix with a letter to avoid any backend quirks about leading digits.
         """
         import hashlib
         
         # Create hash from UID
         hash_bytes = hashlib.sha256(uid.encode()).digest()
         
-        # Use proper base32hex encoding (RFC2938) - alphabet is 0123456789abcdefghijklmnopqrstuv
-        # This is different from standard base32 which uses A-Z234567
+        # Use restricted alphabet allowed by Google: lowercase letters, digits, dash, underscore
+        # We'll base32hex-encode then remap to allowed set if needed
         base32hex_alphabet = '0123456789abcdefghijklmnopqrstuv'
         
         # Manual base32hex encoding to ensure compliance
@@ -708,32 +710,23 @@ class GoogleCalendarService(BaseCalendarService):
             
             return result
         
-        # Generate the base32hex encoded ID
-        event_id = base32hex_encode(hash_bytes)
-        
-        # Truncate to reasonable length (32 chars max for readability)
-        if len(event_id) > 32:
-            event_id = event_id[:32]
-        elif len(event_id) < 5:
-            # Pad with '0' if too short (should not happen with SHA256)
+        # Generate the base32hex encoded ID, then adapt to Google's allowed charset
+        base = base32hex_encode(hash_bytes)
+        # Truncate for practicality
+        if len(base) > 32:
+            base = base[:32]
+        # Remap to allowed set (a-z0-9_-) by translating any 'w'..'v' unused to letters/digits, though
+        # base32hex already yields 0-9 and a-v only; all are lowercase letters/digits, which are allowed.
+        event_id = base
+        # Ensure minimum length
+        if len(event_id) < 5:
             event_id = event_id + '0' * (5 - len(event_id))
-        
-        # Debug logging - show the transformation process
-        self.logger.info(f"🔧 ID generation for UID '{uid}':")
-        self.logger.info(f"   → Hash bytes: {hash_bytes.hex()}")
-        self.logger.info(f"   → Base32hex: '{event_id}' (length: {len(event_id)})")
-        
-        # Validate the final result against Google's requirements
-        if len(event_id) < 5 or len(event_id) > 1024:
-            self.logger.error(f"❌ Generated invalid length event ID: '{event_id}' (length: {len(event_id)}) for UID: {uid}")
-        
-        # Check that all characters are in the valid base32hex alphabet
-        invalid_chars = [c for c in event_id if c not in base32hex_alphabet]
-        if invalid_chars:
-            self.logger.error(f"❌ Generated event ID contains invalid characters: {invalid_chars} in ID: '{event_id}'")
-        else:
-            self.logger.info(f"✅ Generated valid base32hex event ID: '{event_id}' for UID: {uid}")
-        
+        # Ensure starts with a letter to avoid opaque backend constraints
+        if not ('a' <= event_id[0] <= 'z'):
+            event_id = 'e' + event_id[:-1]
+        # Replace any disallowed chars with '-' (should not occur from base32hex)
+        allowed = set('abcdefghijklmnopqrstuvwxyz0123456789-_')
+        event_id = ''.join(c if c in allowed else '-' for c in event_id)
         return event_id
 
     async def _validate_calendar_id(self, calendar_id: str) -> str:
@@ -1031,8 +1024,11 @@ class GoogleCalendarService(BaseCalendarService):
             'location': event.location or ''
         }
         
-        # CRITICAL: Set custom event ID when we already have a UID to prevent duplicates
-        if use_event_id and event.uid:
+        # CRITICAL: Set custom event ID when we already have a UID to prevent duplicates.
+        # IMPORTANT: Do NOT set a custom ID for recurrence override instances.
+        # Google assigns unique IDs to override instances; forcing an ID can cause
+        # "Invalid resource id value" or duplicate-ID conflicts.
+        if use_event_id and event.uid and not event.is_recurrence_override():
             # Generate Google Calendar compliant ID from UID
             event_id = self._generate_compliant_event_id(event.uid)
             self.logger.info(f"🔧 Generated event ID '{event_id}' (length: {len(event_id)}) for UID: {event.uid}")

@@ -305,7 +305,7 @@ class iCloudCalendarService(BaseCalendarService):
                 for href in deleted_hrefs:
                     deleted_native_ids.add(href)
             else:
-                # Fallback: time range snapshot
+                # Fallback: time range snapshot (no deletions detection)
                 events = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: calendar.date_search(start=time_min, end=time_max)
@@ -324,15 +324,8 @@ class iCloudCalendarService(BaseCalendarService):
                         native_id = str(ev.url) if hasattr(ev, 'url') else parsed.id
                         changed[native_id] = parsed
                         count += 1
-                # Try to get a token for next run
-                try:
-                    props = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: calendar.get_properties([caldav.dav.GetEtag()])
-                    )
-                    next_token = props.get(caldav.dav.GetEtag.tag)
-                except Exception:
-                    next_token = None
+                # Do NOT persist ETag as sync token. Only use DAV:sync-token when available from sync-collection.
+                next_token = None
 
             return ChangeSet[CalendarEvent](
                 changed=changed,
@@ -983,13 +976,11 @@ class iCloudCalendarService(BaseCalendarService):
                 ), [], None
     
     async def get_sync_token(self, calendar_id: str) -> str:
-        """Get a sync token for incremental CalDAV sync.
-        
-        Args:
-            calendar_id: iCloud calendar ID (CalDAV URL)
-            
-        Returns:
-            Sync token (CTag) for future incremental calls
+        """Get a CalDAV sync token (DAV:sync-token) for incremental sync.
+
+        Per RFC 6578, clients must use the DAV:sync-token obtained via
+        sync-collection/PROPFIND. ETag/CTag values are not valid sync tokens
+        and must not be stored as such.
         """
         self._ensure_authenticated()
         
@@ -1002,64 +993,33 @@ class iCloudCalendarService(BaseCalendarService):
             
             self.logger.info(f"✅ iCloud CalDAV: Calendar found - URL: {calendar.url}")
             
-            # Get the current CTag (Calendar Collection Tag)
-            # This serves as our sync token for CalDAV
-            self.logger.info(f"📊 iCloud CalDAV: Requesting calendar properties (CTag)")
-            
-            # FIXED: Use correct CalDAV property - GetEtag is the correct class
-            self.logger.info(f"🔧 iCloud CalDAV: Using GetEtag for calendar change detection...")
-            
-            # The CalDAV library uses GetEtag, not GetCtag
-            try:
-                # Verify GetEtag exists
-                if not hasattr(caldav.dav, 'GetEtag'):
-                    raise CalendarServiceError("CalDAV library missing GetEtag class")
-                self.logger.info(f"✅ iCloud CalDAV: GetEtag class found")
-                    
-            except Exception as import_error:
-                self.logger.error(f"💥 iCloud CalDAV: CalDAV import failed: {type(import_error).__name__}: {import_error}")
-                raise CalendarServiceError(f"CalDAV library issue: {import_error}")
-            
-            # Proceed with property request using GetEtag
-            self.logger.info(f"🔧 iCloud CalDAV: Making properties request...")
-            try:
-                props = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: calendar.get_properties([caldav.dav.GetEtag()])
+            # Try to obtain current DAV:sync-token via a lightweight sync-collection
+            self.logger.info(f"📊 iCloud CalDAV: Attempting sync-collection to acquire DAV:sync-token")
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.request(
+                    calendar.url,
+                    "REPORT",
+                    """<?xml version=\"1.0\" encoding=\"utf-8\" ?>
+<D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
+  <D:sync-token/>
+  <D:sync-level>1</D:sync-level>
+  <D:prop>
+    <D:sync-token/>
+  </D:prop>
+</D:sync-collection>""",
+                    headers={
+                        "Content-Type": "application/xml; charset=utf-8",
+                        "Depth": "1",
+                        "Prefer": "return-minimal"
+                    }
                 )
-                self.logger.info(f"✅ iCloud CalDAV: Properties request successful")
-            except Exception as props_error:
-                self.logger.error(f"❌ iCloud CalDAV: Properties request failed: {type(props_error).__name__}: {props_error}")
-                raise
-            
-            self.logger.info(f"📥 iCloud CalDAV: Properties response received")
-            self.logger.info(f"🔍 iCloud CalDAV: Properties type: {type(props)}")
-            self.logger.info(f"🔍 iCloud CalDAV: Available properties: {list(props.keys()) if props else 'None'}")
-            
-            # Get ETag as sync token
-            try:
-                etag_tag = caldav.dav.GetEtag.tag
-                self.logger.info(f"🏷️  iCloud CalDAV: GetEtag.tag = {repr(etag_tag)}")
-            except Exception as tag_error:
-                self.logger.error(f"❌ iCloud CalDAV: Cannot access GetEtag.tag: {type(tag_error).__name__}: {tag_error}")
-                raise
-            
-            etag = props.get(caldav.dav.GetEtag.tag) if props else None
-            self.logger.info(f"🏷️  iCloud CalDAV: ETag extraction result: {repr(etag)}")
-            
-            if not etag:
-                self.logger.error(f"❌ iCloud CalDAV: No ETag found in properties response")
-                self.logger.error(f"🔍 iCloud CalDAV: Full properties dump: {props}")
-                
-                # Try alternative property access methods
-                if props:
-                    for key, value in props.items():
-                        self.logger.error(f"  🔍 Property '{key}': {repr(value)}")
-                
-                raise CalendarServiceError("No ETag returned from iCloud CalDAV")
-                
-            self.logger.info(f"🎯 iCloud CalDAV: ETag acquired successfully: {etag}")
-            return etag
+            )
+            _events, _deleted, next_token = await self._parse_sync_collection_for_changes(response, calendar)
+            if not next_token:
+                raise CalendarServiceError("No DAV:sync-token available from iCloud CalDAV")
+            self.logger.info(f"🎯 iCloud CalDAV: DAV:sync-token acquired successfully")
+            return next_token
             
         except Exception as e:
             raise CalendarServiceError(f"Failed to get iCloud sync token: {e}")
