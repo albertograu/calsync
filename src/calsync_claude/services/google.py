@@ -459,13 +459,16 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         try:
+            # CRITICAL FIX: Validate calendar ID before making API call
+            validated_calendar_id = await self._validate_calendar_id(calendar_id)
+            
             # CRITICAL: Use custom event ID to prevent duplicates during initial sync
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
             
             created_event = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.service.events().insert(
-                    calendarId=calendar_id,
+                    calendarId=validated_calendar_id,
                     body=google_event_data
                 ).execute()
             )
@@ -474,6 +477,62 @@ class GoogleCalendarService(BaseCalendarService):
             
         except Exception as e:
             raise CalendarServiceError(f"Failed to create Google event: {e}")
+    
+    async def _validate_calendar_id(self, calendar_id: str) -> str:
+        """Validate and potentially fix calendar ID format issues.
+        
+        Args:
+            calendar_id: The calendar ID to validate
+            
+        Returns:
+            Validated calendar ID
+            
+        Raises:
+            CalendarServiceError: If calendar ID is invalid
+        """
+        try:
+            # Check if calendar exists by trying to get its info
+            calendar_info = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.calendars().get(calendarId=calendar_id).execute()
+            )
+            
+            return calendar_id  # Calendar exists, ID is valid
+            
+        except HttpError as e:
+            if e.resp.status == 404:
+                # Calendar not found - try common fixes
+                self.logger.warning(f"📋 Google Calendar ID not found: {calendar_id}")
+                
+                # Try to find the correct calendar ID by listing all calendars
+                try:
+                    calendar_list = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.service.calendarList().list().execute()
+                    )
+                    
+                    # Look for primary calendar
+                    for calendar_item in calendar_list.get('items', []):
+                        if calendar_item.get('primary', False):
+                            primary_id = calendar_item['id']
+                            self.logger.warning(f"🔧 Using primary calendar instead: {primary_id}")
+                            return primary_id
+                    
+                    # Fallback to 'primary'
+                    self.logger.warning(f"🔧 Using 'primary' as fallback")
+                    return 'primary'
+                    
+                except Exception as list_error:
+                    self.logger.error(f"Failed to list Google calendars: {list_error}")
+                    # Final fallback
+                    return 'primary'
+            else:
+                # Other HTTP error, re-raise
+                raise CalendarServiceError(f"Calendar ID validation failed: {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error validating calendar ID {calendar_id}: {e}")
+            # Fallback to primary
+            return 'primary'
     
     async def update_event(
         self,
