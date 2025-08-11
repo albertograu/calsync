@@ -510,18 +510,27 @@ class GoogleCalendarService(BaseCalendarService):
         self.logger.info(f"🔍 Validating Google Calendar ID: {calendar_id}")
         
         try:
+            print("🚨 ABOUT TO CHECK CALENDAR EXISTS")
+            self.logger.critical("🚨 ABOUT TO CHECK CALENDAR EXISTS")
+            
             # Check if calendar exists by trying to get its info
             calendar_info = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.service.calendars().get(calendarId=calendar_id).execute()
             )
             
+            print(f"🚨 CALENDAR CHECK SUCCEEDED: {calendar_id}")
+            self.logger.critical(f"🚨 CALENDAR CHECK SUCCEEDED: {calendar_id}")
             self.logger.info(f"✅ Calendar ID is valid: {calendar_id}")
             return calendar_id  # Calendar exists, ID is valid
             
         except HttpError as e:
+            print(f"🚨 HTTP ERROR IN VALIDATION: {e}")
+            self.logger.critical(f"🚨 HTTP ERROR IN VALIDATION: {e}")
             if e.resp.status == 404:
                 # Calendar not found - try common fixes
+                print(f"📋 Google Calendar ID not found: {calendar_id}")
+                self.logger.critical(f"📋 Google Calendar ID not found: {calendar_id}")
                 self.logger.warning(f"📋 Google Calendar ID not found: {calendar_id}")
                 
                 # Try to find the correct calendar ID by listing all calendars
@@ -535,21 +544,31 @@ class GoogleCalendarService(BaseCalendarService):
                     for calendar_item in calendar_list.get('items', []):
                         if calendar_item.get('primary', False):
                             primary_id = calendar_item['id']
+                            print(f"🔧 Using primary calendar instead: {primary_id}")
+                            self.logger.critical(f"🔧 Using primary calendar instead: {primary_id}")
                             self.logger.warning(f"🔧 Using primary calendar instead: {primary_id}")
                             return primary_id
                     
                     # Fallback to 'primary'
+                    print(f"🔧 Using 'primary' as fallback")
+                    self.logger.critical(f"🔧 Using 'primary' as fallback")
                     self.logger.warning(f"🔧 Using 'primary' as fallback")
                     return 'primary'
                     
                 except Exception as list_error:
+                    print(f"Failed to list Google calendars: {list_error}")
+                    self.logger.critical(f"Failed to list Google calendars: {list_error}")
                     self.logger.error(f"Failed to list Google calendars: {list_error}")
                     # Final fallback
                     return 'primary'
             else:
                 # Other HTTP error, re-raise
+                print(f"🚨 OTHER HTTP ERROR: {e}")
+                self.logger.critical(f"🚨 OTHER HTTP ERROR: {e}")
                 raise CalendarServiceError(f"Calendar ID validation failed: {e}")
         except Exception as e:
+            print(f"🚨 UNEXPECTED ERROR IN VALIDATION: {e}")
+            self.logger.critical(f"🚨 UNEXPECTED ERROR IN VALIDATION: {e}")
             self.logger.error(f"Unexpected error validating calendar ID {calendar_id}: {e}")
             # Fallback to primary
             return 'primary'
