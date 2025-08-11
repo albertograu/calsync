@@ -500,10 +500,9 @@ class GoogleCalendarService(BaseCalendarService):
                 self.logger.warning(f"🔄 409 Duplicate error despite deterministic ID - this indicates the event already exists")
                 if event_data.uid:
                     try:
-                        # Use the deterministic ID to update the existing event directly
-                        import hashlib
-                        deterministic_id = hashlib.sha1(event_data.uid.encode()).hexdigest()[:32]
-                        self.logger.info(f"📝 Attempting to update existing event with deterministic ID: {deterministic_id}")
+                        # Use the same compliant deterministic ID generation
+                        deterministic_id = self._generate_compliant_event_id(event_data.uid)
+                        self.logger.info(f"📝 Attempting to update existing event with compliant deterministic ID: {deterministic_id}")
                         return await self.update_event(validated_calendar_id, deterministic_id, event_data)
                     except Exception as update_error:
                         self.logger.error(f"Failed to update with deterministic ID: {update_error}")
@@ -675,6 +674,39 @@ class GoogleCalendarService(BaseCalendarService):
         except Exception as e:
             self.logger.warning(f"Failed to perform content-based search: {e}")
             return []
+
+    def _generate_compliant_event_id(self, uid: str) -> str:
+        """Generate Google Calendar compliant event ID from UID.
+        
+        Google Calendar event IDs must:
+        - Use base32hex encoding: only lowercase letters a-v and digits 0-9
+        - Be between 5 and 1024 characters long
+        """
+        import hashlib
+        import base64
+        
+        # Create hash from UID
+        hash_bytes = hashlib.sha256(uid.encode()).digest()
+        
+        # Convert to base32 and make it Google Calendar compliant
+        base32_id = base64.b32encode(hash_bytes).decode().lower()
+        
+        # Replace characters outside a-v range to make it compliant
+        # Map w-z to a-d to stay within a-v range
+        compliant_id = ""
+        for char in base32_id:
+            if char in 'wxyz':
+                # Map w->a, x->b, y->c, z->d
+                compliant_id += chr(ord('a') + ord(char) - ord('w'))
+            elif char.isalnum() and 'a' <= char <= 'v':
+                compliant_id += char
+            elif char.isdigit():
+                compliant_id += char
+            # Skip padding characters (=) and other invalid chars
+        
+        # Ensure length is between 5 and 32 (reasonable limit)
+        event_id = compliant_id[:32] if len(compliant_id) >= 5 else (compliant_id + '0' * (5 - len(compliant_id)))
+        return event_id
 
     async def _validate_calendar_id(self, calendar_id: str) -> str:
         """Validate and potentially fix calendar ID format issues.
@@ -973,9 +1005,8 @@ class GoogleCalendarService(BaseCalendarService):
         
         # CRITICAL: Set custom event ID when we already have a UID to prevent duplicates
         if use_event_id and event.uid:
-            # Use a deterministic ID based on the UID to prevent duplicates
-            import hashlib
-            event_id = hashlib.sha1(event.uid.encode()).hexdigest()[:32]
+            # Generate Google Calendar compliant ID from UID
+            event_id = self._generate_compliant_event_id(event.uid)
             google_event['id'] = event_id
         
         # Set iCalUID for cross-platform matching
