@@ -1312,9 +1312,29 @@ class SyncEngine:
                 original_overrides = override_event.recurrence_overrides.copy() if override_event.recurrence_overrides else []
                 original_recurring_id = getattr(override_event, 'recurring_event_id', None)
                 
+                # COMPLETE recurrence metadata cleanup to force normal event treatment
                 override_event.recurrence_overrides = []
+                
+                # Remove recurring_event_id attribute entirely (not just set to None)
                 if hasattr(override_event, 'recurring_event_id'):
-                    override_event.recurring_event_id = None
+                    try:
+                        delattr(override_event, 'recurring_event_id')
+                        self.logger.debug(f"🗑️  Completely removed recurring_event_id attribute")
+                    except (AttributeError, TypeError):
+                        # Fallback to setting None if we can't delete
+                        override_event.recurring_event_id = None
+                        self.logger.debug(f"🗑️  Set recurring_event_id to None (couldn't delete attribute)")
+                
+                # Verify the event is no longer detected as an override
+                post_cleanup_is_override = override_event.is_recurrence_override()
+                if post_cleanup_is_override:
+                    self.logger.error(f"❌ CRITICAL: Event {override_event.id} still detected as override after cleanup!")
+                    self.logger.error(f"  → recurrence_overrides: {override_event.recurrence_overrides}")
+                    self.logger.error(f"  → has recurring_event_id: {hasattr(override_event, 'recurring_event_id')}")
+                    if hasattr(override_event, 'recurring_event_id'):
+                        self.logger.error(f"  → recurring_event_id value: {getattr(override_event, 'recurring_event_id')}")
+                else:
+                    self.logger.debug(f"✅ Event {override_event.id} successfully converted to standalone event")
                 
                 self.logger.debug(f"🧹 Stripped recurrence metadata from orphaned event {override_event.id}")
                 if original_overrides:

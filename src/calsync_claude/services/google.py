@@ -486,14 +486,40 @@ class GoogleCalendarService(BaseCalendarService):
             # This follows Google's best practice: "generate your own unique event ID"
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
             
-            # Log the event data being sent to Google for debugging
-            self.logger.info(f"🔧 Google event payload:")
+            # Enhanced debugging for Google event payload
+            self.logger.info(f"🔧 Google event payload for '{event_data.summary}':")
             self.logger.info(f"   → Summary: {google_event_data.get('summary')}")
+            self.logger.info(f"   → Description length: {len(google_event_data.get('description', ''))}")
+            self.logger.info(f"   → Location length: {len(google_event_data.get('location', ''))}")
             self.logger.info(f"   → Has custom ID: {'id' in google_event_data}")
             if 'id' in google_event_data:
-                self.logger.info(f"   → Custom ID: {google_event_data['id']}")
+                custom_id = google_event_data['id']
+                self.logger.info(f"   → Custom ID: '{custom_id}' (length: {len(custom_id)})")
+                self.logger.info(f"   → ID characters: {set(custom_id)}")
+                # Validate against base32hex
+                base32hex_chars = set('0123456789abcdefghijklmnopqrstuv')
+                invalid_chars = set(custom_id) - base32hex_chars
+                if invalid_chars:
+                    self.logger.error(f"   ❌ INVALID CHARACTERS IN ID: {invalid_chars}")
+                else:
+                    self.logger.info(f"   ✅ ID uses only valid base32hex characters")
             self.logger.info(f"   → iCalUID: {google_event_data.get('iCalUID')}")
+            self.logger.info(f"   → Start: {google_event_data.get('start')}")
+            self.logger.info(f"   → End: {google_event_data.get('end')}")
             self.logger.info(f"   → Calendar ID: {validated_calendar_id}")
+            self.logger.info(f"   → All fields: {list(google_event_data.keys())}")
+            
+            # Extra validation for recurringEventId if present
+            if google_event_data.get('recurringEventId'):
+                rec_id = google_event_data['recurringEventId']
+                self.logger.info(f"   → recurringEventId: '{rec_id}'")
+                rec_id_chars = set(rec_id) if rec_id else set()
+                invalid_rec_chars = rec_id_chars - base32hex_chars
+                if invalid_rec_chars:
+                    self.logger.error(f"   ❌ INVALID CHARACTERS IN recurringEventId: {invalid_rec_chars}")
+                    # Remove invalid recurringEventId to prevent error
+                    google_event_data.pop('recurringEventId', None)
+                    self.logger.warning(f"   🧹 Removed invalid recurringEventId to prevent API error")
             
             # Insert with deterministic ID generated from UID to prevent duplicates
             created_event = await asyncio.get_event_loop().run_in_executor(
@@ -1000,11 +1026,22 @@ class GoogleCalendarService(BaseCalendarService):
         )
     
     def _convert_to_google_format(self, event: CalendarEvent, use_event_id: bool = False) -> Dict[str, Any]:
-        """Convert standard event format to Google Calendar format."""
+        """Convert standard event format to Google Calendar format with validation."""
+        
+        # Sanitize text fields to prevent API errors
+        def sanitize_text(text: str, max_length: int = None) -> str:
+            if not text:
+                return ''
+            # Remove null bytes and other problematic characters
+            sanitized = str(text).replace('\x00', '').strip()
+            if max_length and len(sanitized) > max_length:
+                sanitized = sanitized[:max_length-3] + '...'
+            return sanitized
+        
         google_event = {
-            'summary': event.summary,
-            'description': event.description or '',
-            'location': event.location or ''
+            'summary': sanitize_text(event.summary, 1024),  # Google Calendar limit
+            'description': sanitize_text(event.description, 8192),  # Google Calendar limit
+            'location': sanitize_text(event.location, 1024)  # Google Calendar limit
         }
         
         # CRITICAL: Set custom event ID when we already have a UID to prevent duplicates.
@@ -1030,16 +1067,36 @@ class GoogleCalendarService(BaseCalendarService):
         
         # Set iCalUID for cross-platform matching
         if event.uid:
-            google_event['iCalUID'] = event.uid
+            # Ensure iCalUID is valid (no special characters that could cause issues)
+            clean_uid = str(event.uid).strip()
+            if clean_uid:
+                google_event['iCalUID'] = clean_uid
+                self.logger.debug(f"Set iCalUID: {clean_uid}")
+            else:
+                self.logger.warning(f"Event UID is empty after cleaning: '{event.uid}'")
         
         if event.all_day:
-            # All-day event
-            google_event['start'] = {'date': event.start.strftime('%Y-%m-%d')}
-            google_event['end'] = {'date': event.end.strftime('%Y-%m-%d')}
+            # All-day event - ensure valid date format
+            try:
+                start_date = event.start.strftime('%Y-%m-%d')
+                end_date = event.end.strftime('%Y-%m-%d')
+                google_event['start'] = {'date': start_date}
+                google_event['end'] = {'date': end_date}
+                self.logger.debug(f"Set all-day dates: {start_date} to {end_date}")
+            except Exception as e:
+                self.logger.error(f"Failed to format all-day dates: {e}")
+                raise CalendarServiceError(f"Invalid date format for all-day event: {e}")
         else:
-            # Timed event
-            google_event['start'] = {'dateTime': event.start.isoformat()}
-            google_event['end'] = {'dateTime': event.end.isoformat()}
+            # Timed event - ensure valid datetime format
+            try:
+                start_dt = event.start.isoformat()
+                end_dt = event.end.isoformat()
+                google_event['start'] = {'dateTime': start_dt}
+                google_event['end'] = {'dateTime': end_dt}
+                self.logger.debug(f"Set timed datetimes: {start_dt} to {end_dt}")
+            except Exception as e:
+                self.logger.error(f"Failed to format datetime: {e}")
+                raise CalendarServiceError(f"Invalid datetime format for timed event: {e}")
         
         # Add sequence for conflict resolution
         if event.sequence is not None:
