@@ -454,6 +454,9 @@ class GoogleCalendarService(BaseCalendarService):
         self._ensure_authenticated()
         
         self.logger.info(f"🔍 Creating Google Calendar event: {event_data.summary}")
+        self.logger.info(f"   → Original calendar ID: {calendar_id}")
+        self.logger.info(f"   → Event UID: {event_data.uid}")
+        self.logger.info(f"   → Event source: {event_data.source}")
         
         # Validate calendar ID first
         validated_calendar_id = await self._validate_calendar_id(calendar_id)
@@ -482,6 +485,15 @@ class GoogleCalendarService(BaseCalendarService):
             # Convert event data WITH event ID generation to prevent duplicates
             # This follows Google's best practice: "generate your own unique event ID"
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
+            
+            # Log the event data being sent to Google for debugging
+            self.logger.info(f"🔧 Google event payload:")
+            self.logger.info(f"   → Summary: {google_event_data.get('summary')}")
+            self.logger.info(f"   → Has custom ID: {'id' in google_event_data}")
+            if 'id' in google_event_data:
+                self.logger.info(f"   → Custom ID: {google_event_data['id']}")
+            self.logger.info(f"   → iCalUID: {google_event_data.get('iCalUID')}")
+            self.logger.info(f"   → Calendar ID: {validated_calendar_id}")
             
             # Insert with deterministic ID generated from UID to prevent duplicates
             created_event = await asyncio.get_event_loop().run_in_executor(
@@ -1028,11 +1040,22 @@ class GoogleCalendarService(BaseCalendarService):
         # IMPORTANT: Do NOT set a custom ID for recurrence override instances.
         # Google assigns unique IDs to override instances; forcing an ID can cause
         # "Invalid resource id value" or duplicate-ID conflicts.
-        if use_event_id and event.uid and not event.is_recurrence_override():
-            # Generate Google Calendar compliant ID from UID
-            event_id = self._generate_compliant_event_id(event.uid)
-            self.logger.info(f"🔧 Generated event ID '{event_id}' (length: {len(event_id)}) for UID: {event.uid}")
-            google_event['id'] = event_id
+        if use_event_id and event.uid:
+            is_override = event.is_recurrence_override()
+            self.logger.info(f"🔍 Event ID decision for '{event.summary}' (UID: {event.uid})")
+            self.logger.info(f"   → Is recurrence override: {is_override}")
+            self.logger.info(f"   → Recurrence overrides: {event.recurrence_overrides}")
+            self.logger.info(f"   → Has recurring_event_id: {hasattr(event, 'recurring_event_id') and getattr(event, 'recurring_event_id', None)}")
+            
+            if not is_override:
+                # Generate Google Calendar compliant ID from UID
+                event_id = self._generate_compliant_event_id(event.uid)
+                self.logger.info(f"🔧 Generated event ID '{event_id}' (length: {len(event_id)}) for UID: {event.uid}")
+                google_event['id'] = event_id
+            else:
+                self.logger.info(f"⚠️  Skipping custom ID for recurrence override event: {event.summary}")
+        elif use_event_id:
+            self.logger.info(f"⚠️  Skipping event ID generation - missing UID for event: {event.summary}")
         
         # Set iCalUID for cross-platform matching
         if event.uid:
@@ -1063,11 +1086,28 @@ class GoogleCalendarService(BaseCalendarService):
                     if override.get('master_event_id'):
                         google_event['recurringEventId'] = override['master_event_id']
                     
-                    # Set original start time for Google Calendar
-                    if override.get('original_start'):
-                        google_event['originalStartTime'] = {
-                            'dateTime': override['original_start']
-                        }
+                    # CRITICAL FIX: Set originalStartTime for Google Calendar exception events
+                    # Google requires this field for recurrence exceptions
+                    original_start = override.get('original_start') or override.get('recurrence_id')
+                    if original_start:
+                        try:
+                            # Parse the original start time
+                            from dateutil.parser import parse as parse_date
+                            original_dt = parse_date(original_start)
+                            
+                            if event.all_day:
+                                google_event['originalStartTime'] = {
+                                    'date': original_dt.strftime('%Y-%m-%d')
+                                }
+                            else:
+                                google_event['originalStartTime'] = {
+                                    'dateTime': original_dt.isoformat()
+                                }
+                            self.logger.info(f"✅ Set originalStartTime for recurrence exception: {original_start}")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to parse originalStartTime from {original_start}: {e}")
+                    else:
+                        self.logger.warning(f"Missing original start time for recurrence exception: {event.summary}")
         
         # Add attendees if present
         if event.attendees:

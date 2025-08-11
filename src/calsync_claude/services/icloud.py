@@ -263,19 +263,62 @@ class iCloudCalendarService(BaseCalendarService):
             used_sync = bool(sync_token)
 
             if sync_token:
-                # Use sync-collection REPORT to get deltas
-                self.logger.info(f"🔍 Making sync-collection request:")
-                self.logger.info(f"  Calendar ID: {calendar_id}")
-                self.logger.info(f"  Calendar URL: {calendar.url if calendar else 'None'}")
-                self.logger.info(f"  Client URL: {getattr(self.client, 'url', 'Unknown')}")
-                self.logger.info(f"  Sync token: {sync_token[:50]}..." if sync_token else "  No sync token")
-                
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.client.request(
-                        calendar.url,
-                        "REPORT",
-                        f"""<?xml version=\"1.0\" encoding=\"utf-8\" ?>
+                # Check if this is a fallback CTag token
+                if sync_token.startswith("ctag:"):
+                    self.logger.info(f"🔍 Using CTag fallback sync method:")
+                    self.logger.info(f"  Calendar ID: {calendar_id}")
+                    self.logger.info(f"  Fallback token: {sync_token[:50]}...")
+                    
+                    # Extract the CTag value
+                    current_ctag = sync_token[5:]  # Remove "ctag:" prefix
+                    
+                    # Get current calendar CTag
+                    props = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: calendar.get_properties([caldav.dav.GetEtag()])
+                    )
+                    new_ctag = props.get(caldav.dav.GetEtag.tag)
+                    
+                    if new_ctag and new_ctag != current_ctag:
+                        # CTag changed - do full sync but mark as using sync token
+                        self.logger.info(f"📊 CTag changed ({current_ctag} → {new_ctag}), full sync needed")
+                        events = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: calendar.date_search(start=time_min, end=time_max)
+                        )
+                        count = 0
+                        for ev in events:
+                            if max_results and count >= max_results:
+                                break
+                            parsed = self._parse_caldav_event(ev)
+                            if parsed:
+                                if updated_min:
+                                    parsed_updated = self._ensure_timezone_aware(parsed.updated)
+                                    min_updated = self._ensure_timezone_aware(updated_min)
+                                    if parsed_updated < min_updated:
+                                        continue
+                                native_id = str(ev.url) if hasattr(ev, 'url') else parsed.id
+                                changed[native_id] = parsed
+                                count += 1
+                        next_token = f"ctag:{new_ctag}"  # Update to new CTag
+                    else:
+                        # No changes
+                        self.logger.info(f"📊 CTag unchanged ({current_ctag}), no sync needed")
+                        next_token = sync_token  # Keep same token
+                else:
+                    # Use real DAV:sync-token with sync-collection REPORT
+                    self.logger.info(f"🔍 Making sync-collection request:")
+                    self.logger.info(f"  Calendar ID: {calendar_id}")
+                    self.logger.info(f"  Calendar URL: {calendar.url if calendar else 'None'}")
+                    self.logger.info(f"  Client URL: {getattr(self.client, 'url', 'Unknown')}")
+                    self.logger.info(f"  Sync token: {sync_token[:50]}..." if sync_token else "  No sync token")
+                    
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.client.request(
+                            calendar.url,
+                            "REPORT",
+                            f"""<?xml version=\"1.0\" encoding=\"utf-8\" ?>
 <D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
   <D:sync-token>{sync_token}</D:sync-token>
   <D:sync-level>1</D:sync-level>
@@ -284,26 +327,26 @@ class iCloudCalendarService(BaseCalendarService):
     <C:calendar-data/>
   </D:prop>
 </D:sync-collection>""",
-                        headers={
-                            "Content-Type": "application/xml; charset=utf-8",
-                            "Depth": "1",
-                            "Prefer": "return-minimal"
-                        }
+                            headers={
+                                "Content-Type": "application/xml; charset=utf-8",
+                                "Depth": "1",
+                                "Prefer": "return-minimal"
+                            }
+                        )
                     )
-                )
 
-                # Parse for changes and deletions
-                events, deleted_hrefs, extracted_next = await self._parse_sync_collection_for_changes(response, calendar)
-                next_token = extracted_next
+                    # Parse for changes and deletions
+                    events, deleted_hrefs, extracted_next = await self._parse_sync_collection_for_changes(response, calendar)
+                    next_token = extracted_next
 
-                # Turn events into CalendarEvent and key by href
-                for ev in events:
-                    parsed = self._parse_caldav_event(ev)
-                    if parsed:
-                        native_id = str(ev.url)
-                        changed[native_id] = parsed
-                for href in deleted_hrefs:
-                    deleted_native_ids.add(href)
+                    # Turn events into CalendarEvent and key by href
+                    for ev in events:
+                        parsed = self._parse_caldav_event(ev)
+                        if parsed:
+                            native_id = str(ev.url)
+                            changed[native_id] = parsed
+                    for href in deleted_hrefs:
+                        deleted_native_ids.add(href)
             else:
                 # Fallback: time range snapshot (no deletions detection)
                 events = await asyncio.get_event_loop().run_in_executor(
@@ -584,6 +627,152 @@ class iCloudCalendarService(BaseCalendarService):
             )
         except Exception as e:
             raise CalendarServiceError(f"Failed to add EXDATE to {href}: {e}")
+
+    async def merge_recurrence_exception(
+        self,
+        calendar_id: str,
+        master_uid: str,
+        exception_event: 'CalendarEvent'
+    ) -> 'CalendarEvent':
+        """Merge a Google Calendar recurrence exception into the iCloud master event.
+        
+        Instead of creating separate events with the same UID, this properly handles
+        Google Calendar exceptions by either:
+        1. Adding EXDATE if the exception is a cancellation
+        2. Creating a proper VEVENT with RECURRENCE-ID if the exception is modified
+        
+        Args:
+            calendar_id: iCloud calendar ID
+            master_uid: UID of the master recurring event
+            exception_event: The exception event from Google Calendar
+            
+        Returns:
+            Updated master event or exception event as appropriate
+        """
+        self._ensure_authenticated()
+        
+        try:
+            calendar = await self._find_calendar_by_id(calendar_id)
+            if not calendar:
+                raise CalendarServiceError(f"iCloud calendar {calendar_id} not found")
+            
+            # Find the master recurring event by UID
+            events = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: calendar.events()
+            )
+            
+            master_event = None
+            for event in events:
+                try:
+                    parsed = self._parse_caldav_event(event)
+                    if parsed and parsed.uid == master_uid and parsed.recurrence_rule:
+                        master_event = event
+                        break
+                except Exception:
+                    continue
+            
+            if not master_event:
+                self.logger.warning(f"Master recurring event not found for UID {master_uid}, creating standalone exception")
+                return await self.create_event(calendar_id, exception_event)
+            
+            # Parse the master event's iCal data
+            cal = Calendar.from_ical(master_event.data)
+            master_vevent = next((c for c in cal.walk() if c.name == 'VEVENT'), None)
+            if not master_vevent:
+                raise CalendarServiceError("Invalid master event: missing VEVENT")
+            
+            # Determine the original start time for this exception
+            # This should come from Google's recurringEventId information
+            original_start = None
+            if hasattr(exception_event, 'original_data') and exception_event.original_data:
+                google_data = exception_event.original_data.get('google_event', {})
+                original_start_data = google_data.get('originalStartTime')
+                if original_start_data:
+                    if 'dateTime' in original_start_data:
+                        from dateutil.parser import parse as parse_date
+                        original_start = parse_date(original_start_data['dateTime'])
+                    elif 'date' in original_start_data:
+                        from datetime import datetime
+                        from dateutil.parser import parse as parse_date
+                        original_start = parse_date(original_start_data['date'])
+            
+            if not original_start:
+                # Fallback: use the exception event's start time as the original time
+                # This isn't perfect but better than failing
+                original_start = exception_event.start
+                self.logger.warning(f"Using exception start time as original start for {exception_event.summary}")
+            
+            # Check if this is a cancellation (deleted) or modification
+            if hasattr(exception_event, 'status') and exception_event.status == 'cancelled':
+                # This is a cancellation - add EXDATE
+                self.logger.info(f"Adding EXDATE for cancelled recurrence: {original_start}")
+                if exception_event.all_day:
+                    master_vevent.add('exdate', original_start.date())
+                else:
+                    master_vevent.add('exdate', original_start)
+                
+                # Increment sequence
+                try:
+                    seq = int(master_vevent.get('sequence', 0)) + 1
+                    master_vevent['sequence'] = seq
+                except Exception:
+                    pass
+                
+                # Save the updated master event
+                updated_ics = cal.to_ical().decode('utf-8')
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: setattr(master_event, 'data', updated_ics) or master_event.save()
+                )
+                
+                return self._parse_caldav_event(master_event)
+                
+            else:
+                # This is a modification - create a separate VEVENT with RECURRENCE-ID
+                self.logger.info(f"Creating recurrence exception VEVENT for {exception_event.summary}")
+                
+                # Create exception VEVENT
+                exception_ical = self._create_ical_event(exception_event)
+                exception_cal = Calendar.from_ical(exception_ical)
+                exception_vevent = next((c for c in exception_cal.walk() if c.name == 'VEVENT'), None)
+                
+                if exception_vevent:
+                    # Add RECURRENCE-ID to mark this as an exception
+                    if exception_event.all_day:
+                        exception_vevent.add('recurrence-id', original_start.date())
+                    else:
+                        exception_vevent.add('recurrence-id', original_start)
+                    
+                    # Ensure the UID matches the master event
+                    exception_vevent['uid'] = master_uid
+                    
+                    # Add the exception VEVENT to the master calendar
+                    cal.add_component(exception_vevent)
+                    
+                    # Increment master sequence
+                    try:
+                        seq = int(master_vevent.get('sequence', 0)) + 1
+                        master_vevent['sequence'] = seq
+                    except Exception:
+                        pass
+                    
+                    # Save the updated calendar with both master and exception
+                    updated_ics = cal.to_ical().decode('utf-8')
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: setattr(master_event, 'data', updated_ics) or master_event.save()
+                    )
+                    
+                    # Return the exception event data
+                    return exception_event
+                else:
+                    raise CalendarServiceError("Failed to parse exception event iCal data")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to merge recurrence exception: {e}")
+            # Fallback: create as standalone event
+            return await self.create_event(calendar_id, exception_event)
     
     async def _find_calendar_by_id(self, calendar_id: str):
         """Find calendar object by ID."""
@@ -981,6 +1170,11 @@ class iCloudCalendarService(BaseCalendarService):
         Per RFC 6578, clients must use the DAV:sync-token obtained via
         sync-collection/PROPFIND. ETag/CTag values are not valid sync tokens
         and must not be stored as such.
+        
+        STABILITY IMPROVEMENTS:
+        - Use multiple attempts with different approaches
+        - Better error handling for iCloud's inconsistent token support
+        - Fallback strategies when sync-collection is not available
         """
         self._ensure_authenticated()
         
@@ -993,14 +1187,15 @@ class iCloudCalendarService(BaseCalendarService):
             
             self.logger.info(f"✅ iCloud CalDAV: Calendar found - URL: {calendar.url}")
             
-            # Try to obtain current DAV:sync-token via a lightweight sync-collection
-            self.logger.info(f"📊 iCloud CalDAV: Attempting sync-collection to acquire DAV:sync-token")
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.request(
-                    calendar.url,
-                    "REPORT",
-                    """<?xml version=\"1.0\" encoding=\"utf-8\" ?>
+            # STRATEGY 1: Try minimal sync-collection to get initial token
+            try:
+                self.logger.info(f"📊 Attempt 1: Minimal sync-collection for DAV:sync-token")
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.client.request(
+                        calendar.url,
+                        "REPORT",
+                        """<?xml version=\"1.0\" encoding=\"utf-8\" ?>
 <D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
   <D:sync-token/>
   <D:sync-level>1</D:sync-level>
@@ -1008,18 +1203,72 @@ class iCloudCalendarService(BaseCalendarService):
     <D:sync-token/>
   </D:prop>
 </D:sync-collection>""",
-                    headers={
-                        "Content-Type": "application/xml; charset=utf-8",
-                        "Depth": "1",
-                        "Prefer": "return-minimal"
-                    }
+                        headers={
+                            "Content-Type": "application/xml; charset=utf-8",
+                            "Depth": "1",
+                            "Prefer": "return-minimal"
+                        }
+                    )
                 )
-            )
-            _events, _deleted, next_token = await self._parse_sync_collection_for_changes(response, calendar)
-            if not next_token:
-                raise CalendarServiceError("No DAV:sync-token available from iCloud CalDAV")
-            self.logger.info(f"🎯 iCloud CalDAV: DAV:sync-token acquired successfully")
-            return next_token
+                _events, _deleted, next_token = await self._parse_sync_collection_for_changes(response, calendar)
+                if next_token:
+                    self.logger.info(f"🎯 Strategy 1 SUCCESS: DAV:sync-token acquired: {next_token[:20]}...")
+                    return next_token
+                else:
+                    self.logger.warning("📊 Strategy 1: No sync token in response, trying strategy 2")
+            except Exception as e1:
+                self.logger.warning(f"📊 Strategy 1 FAILED: {e1}")
+            
+            # STRATEGY 2: Try sync-collection with empty token (gets initial state)
+            try:
+                self.logger.info(f"📊 Attempt 2: Empty token sync-collection for initial state")
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.client.request(
+                        calendar.url,
+                        "REPORT",
+                        """<?xml version=\"1.0\" encoding=\"utf-8\" ?>
+<D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
+  <D:sync-token></D:sync-token>
+  <D:sync-level>1</D:sync-level>
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>
+</D:sync-collection>""",
+                        headers={
+                            "Content-Type": "application/xml; charset=utf-8",
+                            "Depth": "1"
+                        }
+                    )
+                )
+                _events, _deleted, next_token = await self._parse_sync_collection_for_changes(response, calendar)
+                if next_token:
+                    self.logger.info(f"🎯 Strategy 2 SUCCESS: Initial sync token: {next_token[:20]}...")
+                    return next_token
+                else:
+                    self.logger.warning("📊 Strategy 2: No sync token in response, trying strategy 3")
+            except Exception as e2:
+                self.logger.warning(f"📊 Strategy 2 FAILED: {e2}")
+            
+            # STRATEGY 3: Fallback - use calendar CTag as pseudo sync token
+            # This isn't perfect but better than nothing for incremental detection
+            try:
+                self.logger.info(f"📊 Attempt 3: FALLBACK - Using calendar CTag")
+                props = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.get_properties([caldav.dav.GetEtag()])
+                )
+                etag = props.get(caldav.dav.GetEtag.tag)
+                if etag:
+                    fallback_token = f"ctag:{etag}"
+                    self.logger.warning(f"⚠️  Using CTag as fallback sync token: {fallback_token[:20]}...")
+                    return fallback_token
+            except Exception as e3:
+                self.logger.warning(f"📊 Strategy 3 FAILED: {e3}")
+            
+            # ALL STRATEGIES FAILED
+            raise CalendarServiceError("All sync token acquisition strategies failed - iCloud CalDAV sync not available")
             
         except Exception as e:
             raise CalendarServiceError(f"Failed to get iCloud sync token: {e}")

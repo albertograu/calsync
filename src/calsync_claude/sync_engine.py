@@ -748,11 +748,33 @@ class SyncEngine:
                             source_event.summary, False, error=str(e), mapping=mapping
                         )
             else:
-                # Create new event
+                # Create new event - SPECIAL HANDLING FOR RECURRENCE EXCEPTIONS
                 if not dry_run:
-                    created_event = await target_service.create_event(
-                        target_calendar_id, source_event
-                    )
+                    # Check if this is a Google recurrence exception being synced to iCloud
+                    if (source_event.source == EventSource.GOOGLE and 
+                        target_source == EventSource.ICLOUD and
+                        source_event.is_recurrence_override()):
+                        
+                        self.logger.info(f"🔄 Merging Google recurrence exception to iCloud: {source_event.summary}")
+                        
+                        # Find the master event UID - it should be the same as the exception
+                        master_uid = source_event.uid
+                        if not master_uid:
+                            self.logger.warning(f"Missing UID for recurrence exception: {source_event.summary}")
+                            # Fallback to normal creation
+                            created_event = await target_service.create_event(
+                                target_calendar_id, source_event
+                            )
+                        else:
+                            # Use the special merge method instead of create_event
+                            created_event = await target_service.merge_recurrence_exception(
+                                target_calendar_id, master_uid, source_event
+                            )
+                    else:
+                        # Normal event creation
+                        created_event = await target_service.create_event(
+                            target_calendar_id, source_event
+                        )
                     
                     # Extract calendar mapping values before new session to avoid DetachedInstanceError
                     calendar_mapping_id = calendar_mapping.id
