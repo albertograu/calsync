@@ -4,7 +4,7 @@ import asyncio
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, AsyncIterator, Set
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import caldav
 from caldav import DAVClient
@@ -48,6 +48,31 @@ class iCloudCalendarService(BaseCalendarService):
                 None,
                 lambda: self.client.principal()
             )
+            
+            # CRITICAL FIX: Update client URL to match the server-specific URL
+            # iCloud redirects from caldav.icloud.com to server-specific URLs like p65-caldav.icloud.com
+            if hasattr(self.principal, 'url') and self.principal.url:
+                principal_url = str(self.principal.url)
+                # Extract the base URL (protocol + hostname + port)
+                parsed_url = urlparse(principal_url)
+                server_base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                
+                # Update client to use server-specific URL
+                if server_base_url != self.settings.icloud_server_url:
+                    self.logger.info(f"Updating iCloud CalDAV URL from {self.settings.icloud_server_url} to {server_base_url}")
+                    self.client = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: DAVClient(
+                            url=server_base_url,
+                            username=self.settings.icloud_username,
+                            password=self.settings.icloud_password
+                        )
+                    )
+                    # Re-get principal with updated client
+                    self.principal = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.client.principal()
+                    )
             
             self._authenticated = True
             self.logger.info("Successfully authenticated with iCloud CalDAV")
@@ -890,14 +915,16 @@ class iCloudCalendarService(BaseCalendarService):
             return events, deleted_hrefs, next_token
         except Exception as e:
             self.logger.error(f"Failed to parse sync-collection for changes: {e}")
-            return await self._parse_sync_collection_response(response, calendar), [], None
-        except Exception as e:
-            self.logger.error(f"Error parsing sync-collection response: {e}")
-            # Fall back to regular events query
-            return await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: calendar.events()
-            )
+            # Try fallback to regular events query
+            try:
+                return await self._parse_sync_collection_response(response, calendar), [], None
+            except Exception as fallback_error:
+                self.logger.error(f"Fallback sync-collection parsing also failed: {fallback_error}")
+                # Final fallback to regular events query
+                return await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.events()
+                ), [], None
     
     async def get_sync_token(self, calendar_id: str) -> str:
         """Get a sync token for incremental CalDAV sync.

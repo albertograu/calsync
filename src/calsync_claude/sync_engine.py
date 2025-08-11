@@ -95,6 +95,25 @@ class ConflictResolver:
                 return google_event, f"Auto-resolved: Unknown strategy '{strategy}', defaulted to latest (Google)"
             else:
                 return icloud_event, f"Auto-resolved: Unknown strategy '{strategy}', defaulted to latest (iCloud)"
+    
+    def _ensure_timezone_aware(self, dt: datetime) -> datetime:
+        """Ensure datetime is timezone-aware for safe comparison.
+        
+        Args:
+            dt: Datetime object that may be timezone-naive or timezone-aware
+            
+        Returns:
+            Timezone-aware datetime (assumes UTC for naive datetimes)
+        """
+        if dt.tzinfo is None:
+            # Naive datetime - assume UTC
+            return dt.replace(tzinfo=pytz.UTC)
+        elif dt.tzinfo.utcoffset(dt) is None:
+            # Invalid timezone info  
+            return dt.replace(tzinfo=pytz.UTC)
+        else:
+            # Already timezone-aware
+            return dt
 
 
 class SyncEngine:

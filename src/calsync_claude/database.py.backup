@@ -426,6 +426,65 @@ class DatabaseManager:
         
         return query.first()
     
+    def get_sync_statistics(self, session: Session, days: int = 30) -> Dict[str, Any]:
+        """Get synchronization statistics for the past N days."""
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        
+        sessions = session.query(SyncSessionDB).filter(
+            SyncSessionDB.started_at >= cutoff_date
+        ).all()
+        
+        operations = session.query(SyncOperationDB).filter(
+            SyncOperationDB.timestamp >= cutoff_date
+        ).all()
+        
+        return {
+            'period_days': days,
+            'total_sessions': len(sessions),
+            'successful_sessions': len([s for s in sessions if s.status == 'completed']),
+            'failed_sessions': len([s for s in sessions if s.status == 'failed']),
+            'total_operations': len(operations),
+            'successful_operations': len([o for o in operations if o.success]),
+            'failed_operations': len([o for o in operations if not o.success])
+        }
+    
+    def validate_database_integrity(self, session: Session) -> Dict[str, Any]:
+        """Validate database integrity and return health report."""
+        issues = []
+        
+        # Check for mappings without UIDs
+        mappings_without_uid = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid.is_(None),
+            EventMappingDB.google_ical_uid.is_(None),
+            EventMappingDB.icloud_uid.is_(None),
+            EventMappingDB.sync_status == 'active'
+        ).count()
+        
+        if mappings_without_uid > 0:
+            issues.append(f"{mappings_without_uid} active event mappings without any UID")
+        
+        # Check for calendar mappings without sync tokens
+        mappings_without_tokens = session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_sync_token.is_(None),
+            CalendarMappingDB.icloud_sync_token.is_(None),
+            CalendarMappingDB.enabled == True
+        ).count()
+        
+        if mappings_without_tokens > 0:
+            issues.append(f"{mappings_without_tokens} enabled calendar mappings without sync tokens")
+        
+        return {
+            'healthy': len(issues) == 0,
+            'issues': issues,
+            'total_calendar_mappings': session.query(CalendarMappingDB).count(),
+            'total_event_mappings': session.query(EventMappingDB).count(),
+            'active_event_mappings': session.query(EventMappingDB).filter(
+                EventMappingDB.sync_status == 'active'
+            ).count()
+        }
+    
     def get_event_mapping_by_google_ical_uid(
         self,
         session: Session,
@@ -452,6 +511,65 @@ class DatabaseManager:
         
         return query.first()
     
+    def get_sync_statistics(self, session: Session, days: int = 30) -> Dict[str, Any]:
+        """Get synchronization statistics for the past N days."""
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        
+        sessions = session.query(SyncSessionDB).filter(
+            SyncSessionDB.started_at >= cutoff_date
+        ).all()
+        
+        operations = session.query(SyncOperationDB).filter(
+            SyncOperationDB.timestamp >= cutoff_date
+        ).all()
+        
+        return {
+            'period_days': days,
+            'total_sessions': len(sessions),
+            'successful_sessions': len([s for s in sessions if s.status == 'completed']),
+            'failed_sessions': len([s for s in sessions if s.status == 'failed']),
+            'total_operations': len(operations),
+            'successful_operations': len([o for o in operations if o.success]),
+            'failed_operations': len([o for o in operations if not o.success])
+        }
+    
+    def validate_database_integrity(self, session: Session) -> Dict[str, Any]:
+        """Validate database integrity and return health report."""
+        issues = []
+        
+        # Check for mappings without UIDs
+        mappings_without_uid = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid.is_(None),
+            EventMappingDB.google_ical_uid.is_(None),
+            EventMappingDB.icloud_uid.is_(None),
+            EventMappingDB.sync_status == 'active'
+        ).count()
+        
+        if mappings_without_uid > 0:
+            issues.append(f"{mappings_without_uid} active event mappings without any UID")
+        
+        # Check for calendar mappings without sync tokens
+        mappings_without_tokens = session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_sync_token.is_(None),
+            CalendarMappingDB.icloud_sync_token.is_(None),
+            CalendarMappingDB.enabled == True
+        ).count()
+        
+        if mappings_without_tokens > 0:
+            issues.append(f"{mappings_without_tokens} enabled calendar mappings without sync tokens")
+        
+        return {
+            'healthy': len(issues) == 0,
+            'issues': issues,
+            'total_calendar_mappings': session.query(CalendarMappingDB).count(),
+            'total_event_mappings': session.query(EventMappingDB).count(),
+            'active_event_mappings': session.query(EventMappingDB).filter(
+                EventMappingDB.sync_status == 'active'
+            ).count()
+        }
+    
     def get_event_mapping_by_icloud_uid(
         self,
         session: Session,
@@ -477,6 +595,65 @@ class DatabaseManager:
             query = query.filter(EventMappingDB.calendar_mapping_id == calendar_mapping_id)
         
         return query.first()
+    
+    def get_sync_statistics(self, session: Session, days: int = 30) -> Dict[str, Any]:
+        """Get synchronization statistics for the past N days."""
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        
+        sessions = session.query(SyncSessionDB).filter(
+            SyncSessionDB.started_at >= cutoff_date
+        ).all()
+        
+        operations = session.query(SyncOperationDB).filter(
+            SyncOperationDB.timestamp >= cutoff_date
+        ).all()
+        
+        return {
+            'period_days': days,
+            'total_sessions': len(sessions),
+            'successful_sessions': len([s for s in sessions if s.status == 'completed']),
+            'failed_sessions': len([s for s in sessions if s.status == 'failed']),
+            'total_operations': len(operations),
+            'successful_operations': len([o for o in operations if o.success]),
+            'failed_operations': len([o for o in operations if not o.success])
+        }
+    
+    def validate_database_integrity(self, session: Session) -> Dict[str, Any]:
+        """Validate database integrity and return health report."""
+        issues = []
+        
+        # Check for mappings without UIDs
+        mappings_without_uid = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid.is_(None),
+            EventMappingDB.google_ical_uid.is_(None),
+            EventMappingDB.icloud_uid.is_(None),
+            EventMappingDB.sync_status == 'active'
+        ).count()
+        
+        if mappings_without_uid > 0:
+            issues.append(f"{mappings_without_uid} active event mappings without any UID")
+        
+        # Check for calendar mappings without sync tokens
+        mappings_without_tokens = session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_sync_token.is_(None),
+            CalendarMappingDB.icloud_sync_token.is_(None),
+            CalendarMappingDB.enabled == True
+        ).count()
+        
+        if mappings_without_tokens > 0:
+            issues.append(f"{mappings_without_tokens} enabled calendar mappings without sync tokens")
+        
+        return {
+            'healthy': len(issues) == 0,
+            'issues': issues,
+            'total_calendar_mappings': session.query(CalendarMappingDB).count(),
+            'total_event_mappings': session.query(EventMappingDB).count(),
+            'active_event_mappings': session.query(EventMappingDB).filter(
+                EventMappingDB.sync_status == 'active'
+            ).count()
+        }
     
     def create_event_mapping(
         self,
@@ -951,3 +1128,316 @@ class DatabaseManager:
         
         return query.first()
     
+    def get_sync_statistics(self, session: Session, days: int = 30) -> Dict[str, Any]:
+        """Get synchronization statistics for the past N days."""
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        
+        sessions = session.query(SyncSessionDB).filter(
+            SyncSessionDB.started_at >= cutoff_date
+        ).all()
+        
+        operations = session.query(SyncOperationDB).filter(
+            SyncOperationDB.timestamp >= cutoff_date
+        ).all()
+        
+        return {
+            'period_days': days,
+            'total_sessions': len(sessions),
+            'successful_sessions': len([s for s in sessions if s.status == 'completed']),
+            'failed_sessions': len([s for s in sessions if s.status == 'failed']),
+            'total_operations': len(operations),
+            'successful_operations': len([o for o in operations if o.success]),
+            'failed_operations': len([o for o in operations if not o.success])
+        }
+    
+    def validate_database_integrity(self, session: Session) -> Dict[str, Any]:
+        """Validate database integrity and return health report."""
+        issues = []
+        
+        # Check for mappings without UIDs
+        mappings_without_uid = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid.is_(None),
+            EventMappingDB.google_ical_uid.is_(None),
+            EventMappingDB.icloud_uid.is_(None),
+            EventMappingDB.sync_status == 'active'
+        ).count()
+        
+        if mappings_without_uid > 0:
+            issues.append(f"{mappings_without_uid} active event mappings without any UID")
+        
+        # Check for calendar mappings without sync tokens
+        mappings_without_tokens = session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_sync_token.is_(None),
+            CalendarMappingDB.icloud_sync_token.is_(None),
+            CalendarMappingDB.enabled == True
+        ).count()
+        
+        if mappings_without_tokens > 0:
+            issues.append(f"{mappings_without_tokens} enabled calendar mappings without sync tokens")
+        
+        return {
+            'healthy': len(issues) == 0,
+            'issues': issues,
+            'total_calendar_mappings': session.query(CalendarMappingDB).count(),
+            'total_event_mappings': session.query(EventMappingDB).count(),
+            'active_event_mappings': session.query(EventMappingDB).filter(
+                EventMappingDB.sync_status == 'active'
+            ).count()
+        }
+    
+    def get_event_mapping_by_uid(
+        self,
+        session: Session,
+        event_uid: str,
+        calendar_mapping_id: Optional[UUID] = None
+    ) -> Optional[EventMappingDB]:
+        """Get event mapping by canonical UID (CRITICAL for production deduplication).
+        
+        Args:
+            session: Database session
+            event_uid: Canonical event UID
+            calendar_mapping_id: Optional calendar mapping ID to scope search
+            
+        Returns:
+            Event mapping or None if not found
+        """
+        query = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid == event_uid,
+            EventMappingDB.sync_status == 'active'
+        )
+        
+        if calendar_mapping_id:
+            query = query.filter(EventMappingDB.calendar_mapping_id == calendar_mapping_id)
+        
+        return query.first()
+    
+    def get_sync_statistics(self, session: Session, days: int = 30) -> Dict[str, Any]:
+        """Get synchronization statistics for the past N days."""
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        
+        sessions = session.query(SyncSessionDB).filter(
+            SyncSessionDB.started_at >= cutoff_date
+        ).all()
+        
+        operations = session.query(SyncOperationDB).filter(
+            SyncOperationDB.timestamp >= cutoff_date
+        ).all()
+        
+        return {
+            'period_days': days,
+            'total_sessions': len(sessions),
+            'successful_sessions': len([s for s in sessions if s.status == 'completed']),
+            'failed_sessions': len([s for s in sessions if s.status == 'failed']),
+            'total_operations': len(operations),
+            'successful_operations': len([o for o in operations if o.success]),
+            'failed_operations': len([o for o in operations if not o.success])
+        }
+    
+    def validate_database_integrity(self, session: Session) -> Dict[str, Any]:
+        """Validate database integrity and return health report."""
+        issues = []
+        
+        # Check for mappings without UIDs
+        mappings_without_uid = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid.is_(None),
+            EventMappingDB.google_ical_uid.is_(None),
+            EventMappingDB.icloud_uid.is_(None),
+            EventMappingDB.sync_status == 'active'
+        ).count()
+        
+        if mappings_without_uid > 0:
+            issues.append(f"{mappings_without_uid} active event mappings without any UID")
+        
+        # Check for calendar mappings without sync tokens
+        mappings_without_tokens = session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_sync_token.is_(None),
+            CalendarMappingDB.icloud_sync_token.is_(None),
+            CalendarMappingDB.enabled == True
+        ).count()
+        
+        if mappings_without_tokens > 0:
+            issues.append(f"{mappings_without_tokens} enabled calendar mappings without sync tokens")
+        
+        return {
+            'healthy': len(issues) == 0,
+            'issues': issues,
+            'total_calendar_mappings': session.query(CalendarMappingDB).count(),
+            'total_event_mappings': session.query(EventMappingDB).count(),
+            'active_event_mappings': session.query(EventMappingDB).filter(
+                EventMappingDB.sync_status == 'active'
+            ).count()
+        }
+    
+    def get_event_mapping_by_google_ical_uid(
+        self,
+        session: Session,
+        google_ical_uid: str,
+        calendar_mapping_id: Optional[UUID] = None
+    ) -> Optional[EventMappingDB]:
+        """Get event mapping by Google iCalUID (CRITICAL for cross-platform matching).
+        
+        Args:
+            session: Database session
+            google_ical_uid: Google's iCalUID
+            calendar_mapping_id: Optional calendar mapping ID to scope search
+            
+        Returns:
+            Event mapping or None if not found
+        """
+        query = session.query(EventMappingDB).filter(
+            EventMappingDB.google_ical_uid == google_ical_uid,
+            EventMappingDB.sync_status == 'active'
+        )
+        
+        if calendar_mapping_id:
+            query = query.filter(EventMappingDB.calendar_mapping_id == calendar_mapping_id)
+        
+        return query.first()
+    
+    def get_sync_statistics(self, session: Session, days: int = 30) -> Dict[str, Any]:
+        """Get synchronization statistics for the past N days."""
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        
+        sessions = session.query(SyncSessionDB).filter(
+            SyncSessionDB.started_at >= cutoff_date
+        ).all()
+        
+        operations = session.query(SyncOperationDB).filter(
+            SyncOperationDB.timestamp >= cutoff_date
+        ).all()
+        
+        return {
+            'period_days': days,
+            'total_sessions': len(sessions),
+            'successful_sessions': len([s for s in sessions if s.status == 'completed']),
+            'failed_sessions': len([s for s in sessions if s.status == 'failed']),
+            'total_operations': len(operations),
+            'successful_operations': len([o for o in operations if o.success]),
+            'failed_operations': len([o for o in operations if not o.success])
+        }
+    
+    def validate_database_integrity(self, session: Session) -> Dict[str, Any]:
+        """Validate database integrity and return health report."""
+        issues = []
+        
+        # Check for mappings without UIDs
+        mappings_without_uid = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid.is_(None),
+            EventMappingDB.google_ical_uid.is_(None),
+            EventMappingDB.icloud_uid.is_(None),
+            EventMappingDB.sync_status == 'active'
+        ).count()
+        
+        if mappings_without_uid > 0:
+            issues.append(f"{mappings_without_uid} active event mappings without any UID")
+        
+        # Check for calendar mappings without sync tokens
+        mappings_without_tokens = session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_sync_token.is_(None),
+            CalendarMappingDB.icloud_sync_token.is_(None),
+            CalendarMappingDB.enabled == True
+        ).count()
+        
+        if mappings_without_tokens > 0:
+            issues.append(f"{mappings_without_tokens} enabled calendar mappings without sync tokens")
+        
+        return {
+            'healthy': len(issues) == 0,
+            'issues': issues,
+            'total_calendar_mappings': session.query(CalendarMappingDB).count(),
+            'total_event_mappings': session.query(EventMappingDB).count(),
+            'active_event_mappings': session.query(EventMappingDB).filter(
+                EventMappingDB.sync_status == 'active'
+            ).count()
+        }
+    
+    def get_event_mapping_by_icloud_uid(
+        self,
+        session: Session,
+        icloud_uid: str,
+        calendar_mapping_id: Optional[UUID] = None
+    ) -> Optional[EventMappingDB]:
+        """Get event mapping by iCloud UID (CRITICAL for cross-platform matching).
+        
+        Args:
+            session: Database session
+            icloud_uid: iCloud's UID field
+            calendar_mapping_id: Optional calendar mapping ID to scope search
+            
+        Returns:
+            Event mapping or None if not found
+        """
+        query = session.query(EventMappingDB).filter(
+            EventMappingDB.icloud_uid == icloud_uid,
+            EventMappingDB.sync_status == 'active'
+        )
+        
+        if calendar_mapping_id:
+            query = query.filter(EventMappingDB.calendar_mapping_id == calendar_mapping_id)
+        
+        return query.first()
+    
+    def get_sync_statistics(self, session: Session, days: int = 30) -> Dict[str, Any]:
+        """Get synchronization statistics for the past N days."""
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days)
+        
+        sessions = session.query(SyncSessionDB).filter(
+            SyncSessionDB.started_at >= cutoff_date
+        ).all()
+        
+        operations = session.query(SyncOperationDB).filter(
+            SyncOperationDB.timestamp >= cutoff_date
+        ).all()
+        
+        return {
+            'period_days': days,
+            'total_sessions': len(sessions),
+            'successful_sessions': len([s for s in sessions if s.status == 'completed']),
+            'failed_sessions': len([s for s in sessions if s.status == 'failed']),
+            'total_operations': len(operations),
+            'successful_operations': len([o for o in operations if o.success]),
+            'failed_operations': len([o for o in operations if not o.success])
+        }
+    
+    def validate_database_integrity(self, session: Session) -> Dict[str, Any]:
+        """Validate database integrity and return health report."""
+        issues = []
+        
+        # Check for mappings without UIDs
+        mappings_without_uid = session.query(EventMappingDB).filter(
+            EventMappingDB.event_uid.is_(None),
+            EventMappingDB.google_ical_uid.is_(None),
+            EventMappingDB.icloud_uid.is_(None),
+            EventMappingDB.sync_status == 'active'
+        ).count()
+        
+        if mappings_without_uid > 0:
+            issues.append(f"{mappings_without_uid} active event mappings without any UID")
+        
+        # Check for calendar mappings without sync tokens
+        mappings_without_tokens = session.query(CalendarMappingDB).filter(
+            CalendarMappingDB.google_sync_token.is_(None),
+            CalendarMappingDB.icloud_sync_token.is_(None),
+            CalendarMappingDB.enabled == True
+        ).count()
+        
+        if mappings_without_tokens > 0:
+            issues.append(f"{mappings_without_tokens} enabled calendar mappings without sync tokens")
+        
+        return {
+            'healthy': len(issues) == 0,
+            'issues': issues,
+            'total_calendar_mappings': session.query(CalendarMappingDB).count(),
+            'total_event_mappings': session.query(EventMappingDB).count(),
+            'active_event_mappings': session.query(EventMappingDB).filter(
+                EventMappingDB.sync_status == 'active'
+            ).count()
+        }
