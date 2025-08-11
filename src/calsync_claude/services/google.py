@@ -458,9 +458,16 @@ class GoogleCalendarService(BaseCalendarService):
         self.logger.info(f"   → Event UID: {event_data.uid}")
         self.logger.info(f"   → Event source: {event_data.source}")
         
+        # CRITICAL DEBUG: Log calendar ID validation
+        print(f"🚨 ORIGINAL CALENDAR ID: {calendar_id}")
+        print(f"🚨 CALENDAR ID LENGTH: {len(calendar_id)}")
+        
         # Validate calendar ID first
         validated_calendar_id = await self._validate_calendar_id(calendar_id)
-        self.logger.info(f"✅ Using validated calendar ID: {validated_calendar_id}")
+        
+        print(f"🚨 VALIDATED CALENDAR ID: {validated_calendar_id}")
+        print(f"🚨 CALENDAR ID IS VALID: {not validated_calendar_id.startswith('91aab076')}")
+        self.logger.error(f"🚨 CALENDAR ID: {calendar_id} -> {validated_calendar_id}")
         
         # With deterministic ID generation, we should rarely get duplicates
         # But keep a simple check for safety
@@ -770,7 +777,15 @@ class GoogleCalendarService(BaseCalendarService):
         Raises:
             CalendarServiceError: If calendar ID is invalid and no fallback available
         """
-        self.logger.debug(f"🔍 Validating Google Calendar ID: {calendar_id}")
+        print(f"🚨 VALIDATING CALENDAR ID: {calendar_id}")
+        self.logger.error(f"🚨 VALIDATING CALENDAR ID: {calendar_id}")
+        
+        # CRITICAL FIX: Reject obviously malformed calendar IDs
+        # That long hex string is definitely not a valid Google Calendar ID
+        if len(calendar_id) > 100 or calendar_id.startswith('91aab076'):
+            print(f"🚨 REJECTING MALFORMED CALENDAR ID: {calendar_id}")
+            self.logger.error(f"🚨 REJECTING MALFORMED CALENDAR ID: {calendar_id}")
+            return await self._find_fallback_calendar()
         
         try:
             # Simple validation: try to get calendar metadata (lightweight operation)
@@ -779,10 +794,14 @@ class GoogleCalendarService(BaseCalendarService):
                 lambda: self.service.calendars().get(calendarId=calendar_id).execute()
             )
             
-            self.logger.debug(f"✅ Calendar ID is valid: {calendar_id}")
+            print(f"✅ Calendar ID is valid: {calendar_id}")
+            self.logger.error(f"✅ Calendar ID is valid: {calendar_id}")
             return calendar_id
             
         except HttpError as e:
+            print(f"🚨 Calendar validation failed: {e}")
+            self.logger.error(f"🚨 Calendar validation failed: {e}")
+            
             # Handle invalid calendar ID gracefully
             if e.resp.status == 400:
                 self.logger.warning(f"📋 Google Calendar ID format invalid: {calendar_id}")
