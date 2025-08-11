@@ -690,26 +690,25 @@ class GoogleCalendarService(BaseCalendarService):
     def _generate_compliant_event_id(self, uid: str) -> str:
         """Generate a Google Calendar-compliant event ID from a UID.
 
-        Per Google Calendar API (Events resource), event.id must match:
-        - characters: [a-z0-9_\-]
+        Per Google Calendar API (Events resource) and RFC2938, event.id must use:
+        - characters: [a-v0-9] (base32hex alphabet only)
         - length: 5..1024
         - recommend client-supplied stable IDs to avoid duplicates
 
-        We'll derive a stable identifier using SHA-256 and a safe alphabet, then
-        prefix with a letter to avoid any backend quirks about leading digits.
+        CRITICAL: Google Calendar strictly enforces base32hex format.
+        Using characters outside [a-v0-9] causes "Invalid resource id value" errors.
         """
         import hashlib
         
         # Create hash from UID
         hash_bytes = hashlib.sha256(uid.encode()).digest()
         
-        # Use restricted alphabet allowed by Google: lowercase letters, digits, dash, underscore
-        # We'll base32hex-encode then remap to allowed set if needed
+        # STRICT RFC2938 base32hex alphabet - ONLY these characters are valid for Google Calendar
         base32hex_alphabet = '0123456789abcdefghijklmnopqrstuv'
         
-        # Manual base32hex encoding to ensure compliance
+        # Manual base32hex encoding ensuring strict compliance
         def base32hex_encode(data: bytes) -> str:
-            """Encode bytes using base32hex alphabet (RFC2938)."""
+            """Encode bytes using RFC2938 base32hex alphabet."""
             bits = ''.join(format(byte, '08b') for byte in data)
             # Pad to multiple of 5 bits
             while len(bits) % 5 != 0:
@@ -722,27 +721,28 @@ class GoogleCalendarService(BaseCalendarService):
             
             return result
         
-        # Generate the base32hex encoded ID, then adapt to Google's allowed charset
-        base = base32hex_encode(hash_bytes)
-        # Truncate for practicality
-        if len(base) > 32:
-            base = base[:32]
-        # Remap to allowed set (a-z0-9_-) by translating any 'w'..'v' unused to letters/digits, though
-        # base32hex already yields 0-9 and a-v only; all are lowercase letters/digits, which are allowed.
-        event_id = base
-        # Ensure minimum length
+        # Generate strictly compliant base32hex ID
+        event_id = base32hex_encode(hash_bytes)
+        
+        # Truncate to reasonable length (Google allows up to 1024)
+        if len(event_id) > 32:
+            event_id = event_id[:32]
+        
+        # Ensure minimum length (Google requires at least 5)
         if len(event_id) < 5:
             event_id = event_id + '0' * (5 - len(event_id))
-        # Ensure starts with a letter to avoid opaque backend constraints
-        if not ('a' <= event_id[0] <= 'z'):
-            event_id = 'e' + event_id[:-1]
-        # Replace any disallowed chars with '-' (should not occur from base32hex)
-        allowed = set('abcdefghijklmnopqrstuvwxyz0123456789-_')
-        event_id = ''.join(c if c in allowed else '-' for c in event_id)
+        
+        # Ensure starts with a letter to avoid potential backend issues
+        if event_id[0].isdigit():
+            # Replace first digit with corresponding letter (0->a, 1->b, etc.)
+            first_char = chr(ord('a') + int(event_id[0]))
+            event_id = first_char + event_id[1:]
+        
+        self.logger.debug(f"Generated base32hex event ID: {event_id} (length: {len(event_id)}) from UID: {uid[:20]}...")
         return event_id
 
     async def _validate_calendar_id(self, calendar_id: str) -> str:
-        """Validate and potentially fix calendar ID format issues.
+        """Validate Google Calendar ID efficiently without creating test events.
         
         Args:
             calendar_id: The calendar ID to validate
@@ -751,100 +751,71 @@ class GoogleCalendarService(BaseCalendarService):
             Validated calendar ID
             
         Raises:
-            CalendarServiceError: If calendar ID is invalid
+            CalendarServiceError: If calendar ID is invalid and no fallback available
         """
         self.logger.debug(f"🔍 Validating Google Calendar ID: {calendar_id}")
         
         try:
-            
-            # Test if calendar supports event creation by doing a dry run
-            # Create a minimal test event to check permissions
-            test_event = {
-                'summary': 'CalSync Test Event (will be deleted)',
-                'start': {
-                    'dateTime': '2099-01-01T12:00:00Z',
-                    'timeZone': 'UTC'
-                },
-                'end': {
-                    'dateTime': '2099-01-01T13:00:00Z', 
-                    'timeZone': 'UTC'
-                }
-            }
-            
-            # Try to create a test event to validate the calendar can accept events
-            test_result = await asyncio.get_event_loop().run_in_executor(
+            # Simple validation: try to get calendar metadata (lightweight operation)
+            await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.service.events().insert(
-                    calendarId=calendar_id,
-                    body=test_event
-                ).execute()
+                lambda: self.service.calendars().get(calendarId=calendar_id).execute()
             )
             
-            # Clean up test event immediately
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.service.events().delete(
-                        calendarId=calendar_id,
-                        eventId=test_result['id']
-                    ).execute()
-                )
-            except:
-                pass  # Ignore cleanup errors
-            
-            self.logger.debug(f"✅ Calendar ID supports event creation: {calendar_id}")
-            return calendar_id  # Calendar supports event creation
+            self.logger.debug(f"✅ Calendar ID is valid: {calendar_id}")
+            return calendar_id
             
         except HttpError as e:
-            
-            # Check for invalid calendar ID (400 error) or not found (404)
-            if e.resp.status == 400 and "Invalid resource id value" in str(e):
-                print(f"📋 Google Calendar ID invalid for event creation: {calendar_id}")
-                self.logger.critical(f"📋 Google Calendar ID invalid for event creation: {calendar_id}")
-                self.logger.warning(f"📋 Google Calendar ID invalid for event creation: {calendar_id}")
+            # Handle invalid calendar ID gracefully
+            if e.resp.status == 400:
+                self.logger.warning(f"📋 Google Calendar ID format invalid: {calendar_id}")
             elif e.resp.status == 404:
-                print(f"📋 Google Calendar ID not found: {calendar_id}")
-                self.logger.critical(f"📋 Google Calendar ID not found: {calendar_id}")
-                self.logger.warning(f"📋 Google Calendar ID not found: {calendar_id}")
+                self.logger.warning(f"📋 Google Calendar not found: {calendar_id}")
+            elif e.resp.status == 403:
+                self.logger.warning(f"📋 Google Calendar access denied: {calendar_id}")
             else:
-                print(f"🚨 OTHER HTTP ERROR: {e}")
-                self.logger.critical(f"🚨 OTHER HTTP ERROR: {e}")
-                # Re-raise unknown errors
-                raise CalendarServiceError(f"Calendar ID validation failed: {e}")
+                self.logger.warning(f"📋 Google Calendar validation failed: {e}")
             
-            # For both 400 and 404 errors, try to find the primary calendar
-            try:
-                calendar_list = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.service.calendarList().list().execute()
-                )
-                
-                # Look for primary calendar
-                for calendar_item in calendar_list.get('items', []):
-                    if calendar_item.get('primary', False):
-                        primary_id = calendar_item['id']
-                        print(f"🔧 Using primary calendar instead: {primary_id}")
-                        self.logger.critical(f"🔧 Using primary calendar instead: {primary_id}")
-                        self.logger.warning(f"🔧 Using primary calendar instead: {primary_id}")
-                        return primary_id
-                
-                # Fallback to 'primary'
-                print(f"🔧 Using 'primary' as fallback")
-                self.logger.critical(f"🔧 Using 'primary' as fallback")
-                self.logger.warning(f"🔧 Using 'primary' as fallback")
-                return 'primary'
-                
-            except Exception as list_error:
-                print(f"Failed to list Google calendars: {list_error}")
-                self.logger.critical(f"Failed to list Google calendars: {list_error}")
-                self.logger.error(f"Failed to list Google calendars: {list_error}")
-                # Final fallback
-                return 'primary'
+            # Try to find a working alternative
+            return await self._find_fallback_calendar()
+            
         except Exception as e:
-            print(f"🚨 UNEXPECTED ERROR IN VALIDATION: {e}")
-            self.logger.critical(f"🚨 UNEXPECTED ERROR IN VALIDATION: {e}")
             self.logger.error(f"Unexpected error validating calendar ID {calendar_id}: {e}")
-            # Fallback to primary
+            return await self._find_fallback_calendar()
+    
+    async def _find_fallback_calendar(self) -> str:
+        """Find a fallback Google Calendar when the configured one fails."""
+        try:
+            self.logger.info("🔍 Searching for fallback Google Calendar...")
+            
+            calendar_list = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.calendarList().list().execute()
+            )
+            
+            # Look for primary calendar first
+            for calendar_item in calendar_list.get('items', []):
+                if calendar_item.get('primary', False):
+                    primary_id = calendar_item['id']
+                    self.logger.info(f"✅ Using primary calendar as fallback: {primary_id}")
+                    return primary_id
+            
+            # Look for any writable calendar
+            for calendar_item in calendar_list.get('items', []):
+                access_role = calendar_item.get('accessRole', '')
+                if access_role in ['owner', 'writer']:
+                    fallback_id = calendar_item['id']
+                    calendar_name = calendar_item.get('summary', 'Unknown')
+                    self.logger.info(f"✅ Using writable calendar as fallback: {calendar_name} ({fallback_id})")
+                    return fallback_id
+            
+            # Final fallback to 'primary' keyword
+            self.logger.warning("⚠️  No suitable calendar found, using 'primary' keyword as last resort")
+            return 'primary'
+            
+        except Exception as list_error:
+            self.logger.error(f"Failed to list Google calendars for fallback: {list_error}")
+            # Ultimate fallback
             return 'primary'
     
     async def update_event(

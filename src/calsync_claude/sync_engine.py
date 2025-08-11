@@ -1281,6 +1281,11 @@ class SyncEngine:
             else:
                 # Orphaned override - investigate and handle appropriately
                 self.logger.debug(f"🔍 Investigating orphaned recurrence override: {override_event.id}")
+                self.logger.debug(f"  → UID: {override_event.uid}")
+                self.logger.debug(f"  → Summary: '{override_event.summary}'")
+                self.logger.debug(f"  → Source: {override_event.source.value}")
+                self.logger.debug(f"  → Expected master ID: {master_id}")
+                self.logger.debug(f"  → Available masters: {list(master_events.keys())[:5]}...")
                 
                 # Check if this might be a legitimate standalone event that was misidentified
                 is_likely_override = self._validate_recurrence_override(override_event)
@@ -1288,18 +1293,34 @@ class SyncEngine:
                 if is_likely_override:
                     # This is likely a true orphaned override - log it but treat as standalone
                     self.logger.warning(f"Orphaned recurrence override event: {override_event.id}")
-                    self.logger.debug(f"  → UID: {override_event.uid}")
-                    self.logger.debug(f"  → Summary: {override_event.summary}")
-                    self.logger.debug(f"  → Expected master ID: {master_id}")
+                    self.logger.info(f"  📋 Event '{override_event.summary}' (UID: {override_event.uid}) is a genuine recurrence exception")
+                    self.logger.info(f"  🔍 Master event missing or not synced yet - converting to standalone event")
+                    
+                    # Additional debug info for genuine orphans
+                    if override_event.recurrence_overrides:
+                        for ovr in override_event.recurrence_overrides:
+                            if ovr.get('type') == 'recurrence-id':
+                                self.logger.debug(f"  📅 Original occurrence: {ovr.get('recurrence_id')}")
+                                self.logger.debug(f"  🔗 Master event reference: {ovr.get('master_event_id', 'unknown')}")
                 else:
                     # This might be a false positive - treat as normal standalone event
-                    self.logger.debug(f"✅ Event {override_event.id} reclassified as standalone (not a recurrence override)")
+                    self.logger.info(f"✅ Event {override_event.id} reclassified as standalone (false recurrence detection)")
+                    self.logger.debug(f"  📋 Event '{override_event.summary}' appears to be a regular event, not a recurrence exception")
 
-                # In both cases, strip recurrence metadata and treat as standalone event to ensure it gets synced
-                # Without this cleanup Google API will reject creation with "Invalid resource id value" when
-                # recurringEventId references a non-existent master event.
+                # CRITICAL: Strip recurrence metadata to prevent Google API rejection
+                # Store original data for debugging before cleaning
+                original_overrides = override_event.recurrence_overrides.copy() if override_event.recurrence_overrides else []
+                original_recurring_id = getattr(override_event, 'recurring_event_id', None)
+                
                 override_event.recurrence_overrides = []
-                override_event.recurring_event_id = None
+                if hasattr(override_event, 'recurring_event_id'):
+                    override_event.recurring_event_id = None
+                
+                self.logger.debug(f"🧹 Stripped recurrence metadata from orphaned event {override_event.id}")
+                if original_overrides:
+                    self.logger.debug(f"  🗑️  Removed overrides: {len(original_overrides)} entries")
+                if original_recurring_id:
+                    self.logger.debug(f"  🗑️  Removed recurringEventId: {original_recurring_id}")
 
                 grouped[override_event.id] = {
                     'master': override_event,
@@ -1317,40 +1338,58 @@ class SyncEngine:
         Returns:
             True if this is likely a genuine recurrence override, False if it might be a standalone event
         """
-        # Check for strong indicators of recurrence overrides
+        # Check for definitive indicators of recurrence overrides
         strong_indicators = 0
+        weak_indicators = 0
         
-        # 1. Has recurrence-id in recurrence_overrides
+        # DEFINITIVE INDICATORS (these are conclusive)
+        
+        # 1. Has RECURRENCE-ID in iCal data (iCloud/CalDAV standard)
         if event.recurrence_overrides:
             for override in event.recurrence_overrides:
-                if override.get('type') == 'recurrence-id':
-                    strong_indicators += 2  # Strong indicator
+                if override.get('type') == 'recurrence-id' and override.get('recurrence_id'):
+                    strong_indicators += 3  # Very strong indicator
+                    self.logger.debug(f"Found RECURRENCE-ID: {override.get('recurrence_id')}")
         
-        # 2. Google Calendar recurring_event_id
+        # 2. Google Calendar recurringEventId (Google Calendar specific)
         if hasattr(event, 'recurring_event_id') and event.recurring_event_id:
-            strong_indicators += 2  # Strong indicator
+            strong_indicators += 3  # Very strong indicator  
+            self.logger.debug(f"Found Google recurringEventId: {event.recurring_event_id}")
         
-        # 3. Event summary contains recurrence-like patterns
-        summary = event.summary.lower()
-        if any(pattern in summary for pattern in ['(exception)', '(modified)', '(moved)', '(cancelled)']):
-            strong_indicators += 1
+        # 3. Event has originalStartTime in original data (Google Calendar exception indicator)
+        if (hasattr(event, 'original_data') and event.original_data and 
+            isinstance(event.original_data, dict) and 'originalStartTime' in event.original_data):
+            strong_indicators += 3
+            self.logger.debug(f"Found originalStartTime in Google event data")
         
-        # 4. Check for typical recurrence override patterns in description
+        # WEAK INDICATORS (could be false positives)
+        
+        # 4. Event summary contains recurrence-like patterns (but could be coincidental)
+        if event.summary:
+            summary = event.summary.lower()
+            suspicious_patterns = ['(exception)', '(modified)', '(moved)', '(cancelled)', '(rescheduled)']
+            if any(pattern in summary for pattern in suspicious_patterns):
+                weak_indicators += 1
+                self.logger.debug(f"Found suspicious pattern in summary: {event.summary}")
+        
+        # 5. Check for typical recurrence override patterns in description
         if event.description:
             desc = event.description.lower()
-            if any(pattern in desc for pattern in ['this instance', 'occurrence', 'exception', 'modified from series']):
-                strong_indicators += 1
+            override_patterns = ['this instance', 'occurrence', 'exception', 'modified from series', 'recurring event']
+            if any(pattern in desc for pattern in override_patterns):
+                weak_indicators += 1
+                self.logger.debug(f"Found override pattern in description")
         
-        # If we have strong indicators, it's likely a true override
-        if strong_indicators >= 2:
+        # Decision logic: strong indicators are definitive, weak indicators need multiple
+        if strong_indicators > 0:
+            self.logger.debug(f"Event {event.id}: Strong indicators={strong_indicators}, treating as genuine override")
             return True
-        
-        # If it has some indicators but not strong ones, it might be a false positive
-        # This could happen with events that have similar patterns but aren't actual overrides
-        if strong_indicators == 1:
-            self.logger.debug(f"🤔 Weak recurrence override indicators for {event.id}: {strong_indicators}")
-        
-        return False
+        elif weak_indicators >= 2:
+            self.logger.debug(f"Event {event.id}: Multiple weak indicators={weak_indicators}, likely override")
+            return True
+        else:
+            self.logger.debug(f"Event {event.id}: Insufficient indicators (strong={strong_indicators}, weak={weak_indicators}), treating as standalone")
+            return False
     
     def _is_recurrence_override(self, event: CalendarEvent) -> bool:
         """Check if an event is a recurrence override.

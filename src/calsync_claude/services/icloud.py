@@ -1047,6 +1047,26 @@ class iCloudCalendarService(BaseCalendarService):
                 lambda: calendar.events()
             )
     
+    async def _parse_propfind_sync_token(self, response) -> Optional[str]:
+        """Parse sync token from PROPFIND response."""
+        import xml.etree.ElementTree as ET
+        
+        try:
+            root = ET.fromstring(response.content.decode('utf-8'))
+            namespaces = {'D': 'DAV:'}
+            
+            # Look for sync-token in the response
+            sync_token_elem = root.find('.//D:sync-token', namespaces)
+            if sync_token_elem is not None and sync_token_elem.text:
+                return sync_token_elem.text.strip()
+            
+            self.logger.debug("No sync-token found in PROPFIND response")
+            return None
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to parse PROPFIND sync token response: {e}")
+            return None
+    
     async def _parse_sync_collection_response(self, response, calendar):
         """Parse CalDAV sync-collection XML response to extract events.
 
@@ -1187,49 +1207,48 @@ class iCloudCalendarService(BaseCalendarService):
             
             self.logger.info(f"✅ iCloud CalDAV: Calendar found - URL: {calendar.url}")
             
-            # STRATEGY 1: Try minimal sync-collection to get initial token
+            # STRATEGY 1: Use PROPFIND for initial sync token (more compatible with iCloud)
             try:
-                self.logger.info(f"📊 Attempt 1: Minimal sync-collection for DAV:sync-token")
+                self.logger.info(f"📊 Attempt 1: PROPFIND for initial DAV:sync-token")
                 response = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: self.client.request(
                         calendar.url,
-                        "REPORT",
-                        """<?xml version=\"1.0\" encoding=\"utf-8\" ?>
-<D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
-  <D:sync-token/>
-  <D:sync-level>1</D:sync-level>
+                        "PROPFIND",
+                        """<?xml version="1.0" encoding="utf-8" ?>
+<D:propfind xmlns:D="DAV:">
   <D:prop>
     <D:sync-token/>
+    <D:getetag/>
   </D:prop>
-</D:sync-collection>""",
+</D:propfind>""",
                         headers={
                             "Content-Type": "application/xml; charset=utf-8",
-                            "Depth": "1",
-                            "Prefer": "return-minimal"
+                            "Depth": "0"
                         }
                     )
                 )
-                _events, _deleted, next_token = await self._parse_sync_collection_for_changes(response, calendar)
-                if next_token:
-                    self.logger.info(f"🎯 Strategy 1 SUCCESS: DAV:sync-token acquired: {next_token[:20]}...")
-                    return next_token
+                
+                # Parse PROPFIND response for sync-token
+                sync_token = await self._parse_propfind_sync_token(response)
+                if sync_token:
+                    self.logger.info(f"🎯 Strategy 1 SUCCESS: PROPFIND sync token: {sync_token[:20]}...")
+                    return sync_token
                 else:
-                    self.logger.warning("📊 Strategy 1: No sync token in response, trying strategy 2")
+                    self.logger.warning("📊 Strategy 1: No sync token in PROPFIND response, trying sync-collection")
             except Exception as e1:
                 self.logger.warning(f"📊 Strategy 1 FAILED: {e1}")
             
-            # STRATEGY 2: Try sync-collection with empty token (gets initial state)
+            # STRATEGY 2: Try sync-collection without initial token (RFC 6578 compliant)
             try:
-                self.logger.info(f"📊 Attempt 2: Empty token sync-collection for initial state")
+                self.logger.info(f"📊 Attempt 2: RFC 6578 compliant sync-collection for initial state")
                 response = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: self.client.request(
                         calendar.url,
                         "REPORT",
-                        """<?xml version=\"1.0\" encoding=\"utf-8\" ?>
-<D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">
-  <D:sync-token></D:sync-token>
+                        """<?xml version="1.0" encoding="utf-8"?>
+<D:sync-collection xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:sync-level>1</D:sync-level>
   <D:prop>
     <D:getetag/>
@@ -1244,26 +1263,40 @@ class iCloudCalendarService(BaseCalendarService):
                 )
                 _events, _deleted, next_token = await self._parse_sync_collection_for_changes(response, calendar)
                 if next_token:
-                    self.logger.info(f"🎯 Strategy 2 SUCCESS: Initial sync token: {next_token[:20]}...")
+                    self.logger.info(f"🎯 Strategy 2 SUCCESS: Sync-collection token: {next_token[:20]}...")
                     return next_token
                 else:
-                    self.logger.warning("📊 Strategy 2: No sync token in response, trying strategy 3")
+                    self.logger.warning("📊 Strategy 2: No sync token in response, trying CTag fallback")
             except Exception as e2:
                 self.logger.warning(f"📊 Strategy 2 FAILED: {e2}")
             
-            # STRATEGY 3: Fallback - use calendar CTag as pseudo sync token
-            # This isn't perfect but better than nothing for incremental detection
+            # STRATEGY 3: Enhanced CTag fallback with better reliability
             try:
-                self.logger.info(f"📊 Attempt 3: FALLBACK - Using calendar CTag")
+                self.logger.info(f"📊 Attempt 3: Enhanced CTag fallback")
+                
+                # Get multiple properties to ensure we have the most current state
                 props = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: calendar.get_properties([caldav.dav.GetEtag()])
+                    lambda: calendar.get_properties([
+                        caldav.dav.GetEtag(),
+                        caldav.dav.GetCtag() if hasattr(caldav.dav, 'GetCtag') else caldav.dav.GetEtag()
+                    ])
                 )
+                
+                # Try GetCtag first (collection-level ETag), then GetEtag
+                ctag = props.get(caldav.dav.GetCtag().tag if hasattr(caldav.dav, 'GetCtag') else None)
                 etag = props.get(caldav.dav.GetEtag.tag)
-                if etag:
-                    fallback_token = f"ctag:{etag}"
-                    self.logger.warning(f"⚠️  Using CTag as fallback sync token: {fallback_token[:20]}...")
+                
+                if ctag:
+                    fallback_token = f"ctag:{ctag}"
+                    self.logger.warning(f"⚠️  Using CTag fallback: {fallback_token[:30]}...")
                     return fallback_token
+                elif etag:
+                    fallback_token = f"ctag:{etag}"
+                    self.logger.warning(f"⚠️  Using ETag fallback: {fallback_token[:30]}...")
+                    return fallback_token
+                else:
+                    self.logger.error("❌ No ETag/CTag available for fallback sync token")
             except Exception as e3:
                 self.logger.warning(f"📊 Strategy 3 FAILED: {e3}")
             
