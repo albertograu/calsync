@@ -1076,13 +1076,15 @@ class GoogleCalendarService(BaseCalendarService):
         elif use_event_id:
             self.logger.warning(f"⚠️  Cannot generate event ID - missing UID for event: {event.summary}")
         
-        # Set iCalUID for cross-platform matching
+        # CRITICAL FIX: Test removing iCalUID to see if that's causing the issue
+        # The iCalUID contains hyphens which might be triggering the "Invalid resource id value" error
         if event.uid:
-            # Ensure iCalUID is valid (no special characters that could cause issues)
             clean_uid = str(event.uid).strip()
             if clean_uid:
-                google_event['iCalUID'] = clean_uid
-                self.logger.debug(f"Set iCalUID: {clean_uid}")
+                # TEMPORARILY REMOVE iCalUID to test if it's causing the error
+                # google_event['iCalUID'] = clean_uid
+                print(f"🚨 TEMPORARILY REMOVING iCalUID: {clean_uid}")
+                self.logger.error(f"🚨 TEMPORARILY REMOVING iCalUID: {clean_uid}")
             else:
                 self.logger.warning(f"Event UID is empty after cleaning: '{event.uid}'")
         
