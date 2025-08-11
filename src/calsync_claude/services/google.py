@@ -459,18 +459,10 @@ class GoogleCalendarService(BaseCalendarService):
         validated_calendar_id = await self._validate_calendar_id(calendar_id)
         self.logger.info(f"✅ Using validated calendar ID: {validated_calendar_id}")
         
-        # Check if event already exists by iCalUID to avoid 409 duplicates
+        # With deterministic ID generation, we should rarely get duplicates
+        # But keep a simple check for safety
         if event_data.uid:
-            try:
-                self.logger.info(f"🔍 Checking for existing event with UID: {event_data.uid}")
-                existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
-                if existing_events:
-                    self.logger.info(f"📝 Found {len(existing_events)} existing event(s) with UID {event_data.uid}, updating first one")
-                    return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
-                else:
-                    self.logger.info(f"🆕 No existing event found with UID {event_data.uid}, proceeding with create")
-            except Exception as e:
-                self.logger.warning(f"Could not check for existing event, proceeding with create: {e}")
+            self.logger.debug(f"Creating event with UID: {event_data.uid}")
         
         # Proceed with creation using the validated ID
         return await self._create_event_with_retry(validated_calendar_id, event_data)
@@ -487,10 +479,11 @@ class GoogleCalendarService(BaseCalendarService):
     ) -> CalendarEvent:
         """Create event with retry logic using validated calendar ID."""
         try:
-            # Convert event data without any ID manipulation - let Google handle IDs
-            google_event_data = self._convert_to_google_format(event_data, use_event_id=False)
+            # Convert event data WITH event ID generation to prevent duplicates
+            # This follows Google's best practice: "generate your own unique event ID"
+            google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
             
-            # Simple insert without ID parameter - Google generates ID automatically
+            # Insert with deterministic ID generated from UID to prevent duplicates
             created_event = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.service.events().insert(
@@ -503,17 +496,25 @@ class GoogleCalendarService(BaseCalendarService):
             
         except HttpError as e:
             if e.resp.status == 409 and "duplicate" in str(e).lower():
-                # 409 Duplicate - the event already exists, try to find and update it
-                self.logger.warning(f"🔄 409 Duplicate error, attempting to find and update existing event")
+                # 409 Duplicate - should be rare with deterministic IDs, but handle it
+                self.logger.warning(f"🔄 409 Duplicate error despite deterministic ID - this indicates the event already exists")
                 if event_data.uid:
                     try:
-                        # Try a more thorough search
-                        existing_events = await self._find_events_by_uid_thorough(validated_calendar_id, event_data.uid)
-                        if existing_events:
-                            self.logger.info(f"📝 Found existing duplicate event, updating instead")
-                            return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
-                    except Exception as search_error:
-                        self.logger.error(f"Failed to find duplicate event: {search_error}")
+                        # Use the deterministic ID to update the existing event directly
+                        import hashlib
+                        deterministic_id = hashlib.sha1(event_data.uid.encode()).hexdigest()[:32]
+                        self.logger.info(f"📝 Attempting to update existing event with deterministic ID: {deterministic_id}")
+                        return await self.update_event(validated_calendar_id, deterministic_id, event_data)
+                    except Exception as update_error:
+                        self.logger.error(f"Failed to update with deterministic ID: {update_error}")
+                        # If that fails, the event might exist with a different ID, try UID search
+                        try:
+                            existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
+                            if existing_events:
+                                self.logger.info(f"📝 Found existing event via UID search, updating instead")
+                                return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
+                        except Exception as search_error:
+                            self.logger.error(f"UID search also failed: {search_error}")
             
             self.logger.error(f"❌ Create event failed with validated_calendar_id={validated_calendar_id}, error: {e}")
             raise CalendarServiceError(f"Failed to create Google event: {e}")
@@ -621,6 +622,58 @@ class GoogleCalendarService(BaseCalendarService):
             
         except Exception as e:
             self.logger.warning(f"Failed to perform thorough search for events by UID: {e}")
+            return []
+
+    async def _find_events_by_content(self, calendar_id: str, event_data: CalendarEvent) -> List[Dict[str, Any]]:
+        """Find events by matching content (summary, start time) when UID search fails."""
+        try:
+            # Search around the event's time (±1 day) for efficiency
+            from datetime import timedelta
+            import pytz
+            
+            start_time = event_data.start
+            search_start = (start_time - timedelta(days=1)).isoformat()
+            search_end = (start_time + timedelta(days=1)).isoformat()
+            
+            events_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().list(
+                    calendarId=calendar_id,
+                    timeMin=search_start,
+                    timeMax=search_end,
+                    singleEvents=True,
+                    orderBy='startTime',
+                    maxResults=100
+                ).execute()
+            )
+            
+            events = events_result.get('items', [])
+            matching_events = []
+            
+            self.logger.debug(f"🔍 Content search: Found {len(events)} events in time range")
+            
+            for event in events:
+                # Match by summary and start time (allowing small time differences)
+                if (event.get('summary', '').strip().lower() == event_data.summary.strip().lower()):
+                    
+                    # Check start time match
+                    event_start_str = None
+                    if event_data.all_day:
+                        event_start_str = event.get('start', {}).get('date')
+                        expected_start = event_data.start.strftime('%Y-%m-%d')
+                    else:
+                        event_start_str = event.get('start', {}).get('dateTime', '').split('T')[0] if event.get('start', {}).get('dateTime') else None
+                        expected_start = event_data.start.strftime('%Y-%m-%d')
+                    
+                    if event_start_str and event_start_str.startswith(expected_start):
+                        matching_events.append(event)
+                        self.logger.info(f"✅ Content match found: Event ID {event.get('id')} with summary '{event.get('summary')}' at {event_start_str}")
+            
+            self.logger.info(f"🔍 Content search complete: Found {len(matching_events)} content matches")
+            return matching_events
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to perform content-based search: {e}")
             return []
 
     async def _validate_calendar_id(self, calendar_id: str) -> str:
