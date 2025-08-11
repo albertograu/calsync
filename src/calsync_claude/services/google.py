@@ -490,40 +490,27 @@ class GoogleCalendarService(BaseCalendarService):
             # This follows Google's best practice: "generate your own unique event ID"
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
             
-            # Enhanced debugging for Google event payload
-            self.logger.info(f"🔧 Google event payload for '{event_data.summary}':")
-            self.logger.info(f"   → Summary: {google_event_data.get('summary')}")
-            self.logger.info(f"   → Description length: {len(google_event_data.get('description', ''))}")
-            self.logger.info(f"   → Location length: {len(google_event_data.get('location', ''))}")
-            self.logger.info(f"   → Has custom ID: {'id' in google_event_data}")
-            if 'id' in google_event_data:
-                custom_id = google_event_data['id']
-                self.logger.info(f"   → Custom ID: '{custom_id}' (length: {len(custom_id)})")
-                self.logger.info(f"   → ID characters: {set(custom_id)}")
-                # Validate against base32hex
-                base32hex_chars = set('0123456789abcdefghijklmnopqrstuv')
-                invalid_chars = set(custom_id) - base32hex_chars
-                if invalid_chars:
-                    self.logger.error(f"   ❌ INVALID CHARACTERS IN ID: {invalid_chars}")
-                else:
-                    self.logger.info(f"   ✅ ID uses only valid base32hex characters")
-            self.logger.info(f"   → iCalUID: {google_event_data.get('iCalUID')}")
-            self.logger.info(f"   → Start: {google_event_data.get('start')}")
-            self.logger.info(f"   → End: {google_event_data.get('end')}")
-            self.logger.info(f"   → Calendar ID: {validated_calendar_id}")
-            self.logger.info(f"   → All fields: {list(google_event_data.keys())}")
+            # CRITICAL: Log the EXACT payload being sent to Google
+            print(f"🚨 EXACT GOOGLE PAYLOAD:")
+            print(f"🚨 {google_event_data}")
+            self.logger.error(f"🚨 EXACT GOOGLE PAYLOAD: {google_event_data}")
             
-            # Extra validation for recurringEventId if present
-            if google_event_data.get('recurringEventId'):
-                rec_id = google_event_data['recurringEventId']
-                self.logger.info(f"   → recurringEventId: '{rec_id}'")
-                rec_id_chars = set(rec_id) if rec_id else set()
-                invalid_rec_chars = rec_id_chars - base32hex_chars
-                if invalid_rec_chars:
-                    self.logger.error(f"   ❌ INVALID CHARACTERS IN recurringEventId: {invalid_rec_chars}")
-                    # Remove invalid recurringEventId to prevent error
-                    google_event_data.pop('recurringEventId', None)
-                    self.logger.warning(f"   🧹 Removed invalid recurringEventId to prevent API error")
+            # Check each field for invalid characters
+            for key, value in google_event_data.items():
+                if isinstance(value, str):
+                    # Check for problematic characters
+                    if any(ord(c) > 127 for c in value):
+                        print(f"🚨 NON-ASCII in {key}: {repr(value)}")
+                        self.logger.error(f"🚨 NON-ASCII in {key}: {repr(value)}")
+                    if '\x00' in value:
+                        print(f"🚨 NULL BYTE in {key}: {repr(value)}")
+                        self.logger.error(f"🚨 NULL BYTE in {key}: {repr(value)}")
+                elif isinstance(value, dict):
+                    for subkey, subvalue in value.items():
+                        if isinstance(subvalue, str) and any(ord(c) > 127 for c in subvalue):
+                            print(f"🚨 NON-ASCII in {key}.{subkey}: {repr(subvalue)}")
+                            self.logger.error(f"🚨 NON-ASCII in {key}.{subkey}: {repr(subvalue)}")
+                print(f"🚨 {key}: {value}")
             
             # Insert with deterministic ID generated from UID to prevent duplicates
             created_event = await asyncio.get_event_loop().run_in_executor(
