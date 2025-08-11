@@ -464,11 +464,11 @@ class GoogleCalendarService(BaseCalendarService):
         # Now do the actual creation with retry using the validated ID
         return await self._create_event_with_retry(validated_calendar_id, event_data)
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((HttpError, CalendarServiceError))
-    )
+    # @retry(
+    #     stop=stop_after_attempt(3),
+    #     wait=wait_exponential(multiplier=1, min=4, max=10),
+    #     retry=retry_if_exception_type((HttpError, CalendarServiceError))
+    # )
     async def _create_event_with_retry(
         self,
         validated_calendar_id: str,
@@ -478,6 +478,9 @@ class GoogleCalendarService(BaseCalendarService):
         try:
             # CRITICAL: Use custom event ID to prevent duplicates during initial sync
             google_event_data = self._convert_to_google_format(event_data, use_event_id=True)
+            
+            print(f"🚨 REAL EVENT DATA: {google_event_data}")
+            self.logger.critical(f"🚨 REAL EVENT DATA: {google_event_data}")
             
             created_event = await asyncio.get_event_loop().run_in_executor(
                 None,
