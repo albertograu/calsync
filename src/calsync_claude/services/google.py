@@ -476,36 +476,20 @@ class GoogleCalendarService(BaseCalendarService):
     ) -> CalendarEvent:
         """Create event with retry logic using validated calendar ID."""
         try:
-            # CRITICAL: Get the event ID separately for the insert operation
-            deterministic_id = None
-            if event_data.uid:
-                import hashlib
-                deterministic_id = hashlib.sha1(event_data.uid.encode()).hexdigest()[:32]
-            
-            # Convert event data (without the 'id' field in the body)
+            # Convert event data without any ID manipulation - let Google handle IDs
             google_event_data = self._convert_to_google_format(event_data, use_event_id=False)
             
             print(f"🚨 REAL EVENT DATA: {google_event_data}")
             self.logger.critical(f"🚨 REAL EVENT DATA: {google_event_data}")
             
-            # Use deterministic ID in the insert operation, NOT in the body
-            if deterministic_id:
-                created_event = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.service.events().insert(
-                        calendarId=validated_calendar_id,
-                        eventId=deterministic_id,  # Pass ID as parameter, not in body
-                        body=google_event_data
-                    ).execute()
-                )
-            else:
-                created_event = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.service.events().insert(
-                        calendarId=validated_calendar_id,
-                        body=google_event_data
-                    ).execute()
-                )
+            # Simple insert without ID parameter - Google generates ID automatically
+            created_event = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.events().insert(
+                    calendarId=validated_calendar_id,
+                    body=google_event_data
+                ).execute()
+            )
             
             return self._format_google_event(created_event)
             
