@@ -1,4 +1,4 @@
-# CalSync Claude
+# CalSync vibe coded with Claude
 
 An advanced two-way calendar synchronization tool that keeps your Google Calendar and iCloud Calendar perfectly in sync with enhanced conflict resolution, async operations, and comprehensive monitoring.
 
