@@ -458,16 +458,10 @@ class GoogleCalendarService(BaseCalendarService):
         self.logger.info(f"   → Event UID: {event_data.uid}")
         self.logger.info(f"   → Event source: {event_data.source}")
         
-        # CRITICAL DEBUG: Log calendar ID validation
-        print(f"🚨 ORIGINAL CALENDAR ID: {calendar_id}")
-        print(f"🚨 CALENDAR ID LENGTH: {len(calendar_id)}")
         
         # Validate calendar ID first
         validated_calendar_id = await self._validate_calendar_id(calendar_id)
         
-        print(f"🚨 VALIDATED CALENDAR ID: {validated_calendar_id}")
-        print(f"🚨 CALENDAR ID IS VALID: {not validated_calendar_id.startswith('91aab076')}")
-        self.logger.error(f"🚨 CALENDAR ID: {calendar_id} -> {validated_calendar_id}")
         
         # With deterministic ID generation, we should rarely get duplicates
         # But keep a simple check for safety
@@ -489,10 +483,6 @@ class GoogleCalendarService(BaseCalendarService):
     ) -> CalendarEvent:
         """Create event with retry logic using validated calendar ID."""
         try:
-            # CRITICAL DEBUG: This should always appear in logs
-            print(f"🚨 DEBUG: Creating Google event for '{event_data.summary}' with UID: {event_data.uid}")
-            self.logger.error(f"🚨 DEBUG: Creating Google event for '{event_data.summary}' with UID: {event_data.uid}")
-            
             # Convert event data WITH event ID generation to prevent duplicates
             # This follows Google's best practice: "generate your own unique event ID"
             # WORKING: Use minimal payload that Google accepts
@@ -508,30 +498,7 @@ class GoogleCalendarService(BaseCalendarService):
             if event_data.uid:
                 google_event_data['iCalUID'] = event_data.uid
             
-            print(f"🚨 WORKING PAYLOAD: {google_event_data}")
-            print(f"🚨 TARGET CALENDAR: {validated_calendar_id}")
-            
-            # CRITICAL: Log the EXACT payload being sent to Google
-            print(f"🚨 EXACT GOOGLE PAYLOAD:")
-            print(f"🚨 {google_event_data}")
-            self.logger.error(f"🚨 EXACT GOOGLE PAYLOAD: {google_event_data}")
-            
-            # Check each field for invalid characters
-            for key, value in google_event_data.items():
-                if isinstance(value, str):
-                    # Check for problematic characters
-                    if any(ord(c) > 127 for c in value):
-                        print(f"🚨 NON-ASCII in {key}: {repr(value)}")
-                        self.logger.error(f"🚨 NON-ASCII in {key}: {repr(value)}")
-                    if '\x00' in value:
-                        print(f"🚨 NULL BYTE in {key}: {repr(value)}")
-                        self.logger.error(f"🚨 NULL BYTE in {key}: {repr(value)}")
-                elif isinstance(value, dict):
-                    for subkey, subvalue in value.items():
-                        if isinstance(subvalue, str) and any(ord(c) > 127 for c in subvalue):
-                            print(f"🚨 NON-ASCII in {key}.{subkey}: {repr(subvalue)}")
-                            self.logger.error(f"🚨 NON-ASCII in {key}.{subkey}: {repr(subvalue)}")
-                print(f"🚨 {key}: {value}")
+            # Character validation disabled for performance
             
             # Insert with deterministic ID - but check for duplicates first
             event_id = google_event_data.get('id')
@@ -545,8 +512,6 @@ class GoogleCalendarService(BaseCalendarService):
                             eventId=event_id
                         ).execute()
                     )
-                    print(f"🚨 EVENT ALREADY EXISTS: {event_id}")
-                    self.logger.error(f"🚨 EVENT ALREADY EXISTS: {event_id}")
                     # Update instead of create
                     return await self.update_event(validated_calendar_id, event_id, event_data)
                 except:
@@ -832,8 +797,6 @@ class GoogleCalendarService(BaseCalendarService):
         Raises:
             CalendarServiceError: If calendar ID is invalid and no fallback available
         """
-        print(f"🚨 VALIDATING CALENDAR ID: {calendar_id}")
-        self.logger.error(f"🚨 VALIDATING CALENDAR ID: {calendar_id}")
         
         # Skip pre-validation - let Google Calendar API validate the ID
         # The long hex string might actually be a valid shared/group calendar ID
@@ -845,13 +808,10 @@ class GoogleCalendarService(BaseCalendarService):
                 lambda: self.service.calendars().get(calendarId=calendar_id).execute()
             )
             
-            print(f"✅ Calendar ID is valid: {calendar_id}")
-            self.logger.error(f"✅ Calendar ID is valid: {calendar_id}")
+            self.logger.debug(f"Calendar ID is valid: {calendar_id}")
             return calendar_id
             
         except HttpError as e:
-            print(f"🚨 Calendar validation failed: {e}")
-            self.logger.error(f"🚨 Calendar validation failed: {e}")
             
             # Handle invalid calendar ID gracefully
             if e.resp.status == 400:
@@ -1109,16 +1069,12 @@ class GoogleCalendarService(BaseCalendarService):
         # iCloud uses UUID format (with hyphens) which is invalid for Google Calendar
         # Google Calendar event IDs must be base32hex format [a-v0-9] only
         if use_event_id and event.uid:
-            print(f"🚨 CONVERTING UID TO EVENT ID: {event.uid}")
-            self.logger.error(f"🚨 CONVERTING UID TO EVENT ID: {event.uid}")
             
             # ALWAYS generate compliant ID - ignore recurrence override detection  
             # The recurrence detection logic has issues with orphaned events
             event_id = self._generate_compliant_event_id(event.uid)
             google_event['id'] = event_id
             
-            print(f"🚨 GENERATED EVENT ID: {event_id}")
-            self.logger.error(f"🚨 GENERATED EVENT ID: {event_id}")
             
             self.logger.info(f"✅ Generated compliant event ID: '{event_id}' (length: {len(event_id)})")
             self.logger.info(f"   → Original UID: {event.uid}")
