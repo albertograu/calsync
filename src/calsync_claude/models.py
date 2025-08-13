@@ -70,7 +70,12 @@ class CalendarEvent(BaseModel):
     def end_after_start(cls, v, values):
         """Ensure end time is after start time."""
         if 'start' in values and v <= values['start']:
-            raise ValueError('End time must be after start time')
+            # More detailed error message for debugging
+            start_time = values['start']
+            raise ValueError(
+                f'End time ({v}) must be after start time ({start_time}). '
+                f'This usually indicates timezone conversion issues or corrupted event data.'
+            )
         return v
     
     def content_hash(self) -> str:

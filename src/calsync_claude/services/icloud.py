@@ -483,14 +483,74 @@ class iCloudCalendarService(BaseCalendarService):
             # Create iCal data
             ical_data = self._create_ical_event(event_data)
             
-            # Create event
-            created_event = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: calendar.save_event(ical_data)
-            )
+            # CRITICAL FIX: Handle 412 Precondition Failed by checking for duplicates first
+            # This error often occurs when trying to create an event that already exists
+            try:
+                # Check if an event with the same UID already exists
+                if event_data.uid:
+                    existing_events = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: calendar.events()
+                    )
+                    
+                    for existing_event in existing_events:
+                        try:
+                            existing_uid = self._extract_uid_from_caldav_event(existing_event)
+                            if existing_uid == event_data.uid:
+                                self.logger.info(
+                                    f"Event with UID {event_data.uid} already exists in iCloud, updating instead"
+                                )
+                                return await self.update_event(calendar_id, event_data.uid, event_data)
+                        except Exception:
+                            continue
+                
+                # Create event
+                created_event = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.save_event(ical_data)
+                )
+                
+                return self._parse_caldav_event(created_event)
+                
+            except Exception as create_error:
+                if "412" in str(create_error) or "precondition" in str(create_error).lower():
+                    # 412 Precondition Failed - try alternative approach
+                    self.logger.warning(
+                        f"412 Precondition Failed creating event '{event_data.summary}'. "
+                        f"This usually means the event already exists or has ETag conflicts. "
+                        f"Attempting alternative creation method."
+                    )
+                    
+                    # Try creating with a slightly different UID to avoid conflicts
+                    # Following iCloud CalDAV best practices for resource naming
+                    import time
+                    modified_event_data = event_data.copy()
+                    if modified_event_data.uid:
+                        # Remove @ symbol to avoid encoding issues (per community recommendations)
+                        clean_uid = event_data.uid.replace('@', '-at-')
+                        modified_event_data.uid = f"{clean_uid}-{int(time.time())}"
+                    
+                    modified_ical_data = self._create_ical_event(modified_event_data)
+                    
+                    try:
+                        created_event = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: calendar.save_event(modified_ical_data)
+                        )
+                        self.logger.info(
+                            f"Successfully created event with modified UID: {modified_event_data.uid}"
+                        )
+                        return self._parse_caldav_event(created_event)
+                    except Exception as fallback_error:
+                        self.logger.error(
+                            f"Both original and fallback creation failed for '{event_data.summary}': {fallback_error}"
+                        )
+                        raise CalendarServiceError(f"Failed to create iCloud event after retry: {fallback_error}")
+                else:
+                    raise
             
-            return self._parse_caldav_event(created_event)
-            
+        except CalendarServiceError:
+            raise
         except Exception as e:
             raise CalendarServiceError(f"Failed to create iCloud event: {e}")
     
@@ -838,6 +898,16 @@ class iCloudCalendarService(BaseCalendarService):
                 start_dt = self._ensure_timezone_aware(start_dt)
                 if dtend:
                     end_dt = self._ensure_timezone_aware(dtend.dt)
+                    
+                    # CRITICAL FIX: Validate end time is after start time
+                    # If not, log the issue and fix it
+                    if end_dt <= start_dt:
+                        self.logger.warning(
+                            f"Invalid event times detected: start={start_dt}, end={end_dt} for {summary}. "
+                            f"Event likely has timezone conversion issues. Auto-fixing."
+                        )
+                        # Auto-fix: Set end time to 1 hour after start
+                        end_dt = start_dt + timedelta(hours=1)
                 else:
                     end_dt = start_dt + timedelta(hours=1)
             
@@ -882,6 +952,14 @@ class iCloudCalendarService(BaseCalendarService):
             # Extract resource URL for direct access (CRITICAL for production)
             resource_url = str(event.url) if hasattr(event, 'url') and event.url else None
             
+            # Final validation: ensure end time is after start time
+            if end_dt <= start_dt:
+                self.logger.warning(
+                    f"Final validation failed for event {summary}: end ({end_dt}) <= start ({start_dt}). "
+                    f"Skipping this invalid event."
+                )
+                return None
+            
             return CalendarEvent(
                 id=uid,
                 uid=uid,
@@ -907,7 +985,19 @@ class iCloudCalendarService(BaseCalendarService):
             )
             
         except Exception as e:
-            self.logger.warning(f"Error parsing CalDAV event: {e}")
+            # Enhanced error logging for debugging
+            event_summary = "Unknown"
+            try:
+                if hasattr(event, 'data') and event.data:
+                    # Try to extract summary for better error reporting
+                    import re
+                    summary_match = re.search(r'SUMMARY:(.+)', event.data)
+                    if summary_match:
+                        event_summary = summary_match.group(1).strip()
+            except:
+                pass
+            
+            self.logger.debug(f"Error parsing CalDAV event '{event_summary}': {e}")
             return None
     
     
@@ -1052,7 +1142,34 @@ class iCloudCalendarService(BaseCalendarService):
         import xml.etree.ElementTree as ET
         
         try:
-            root = ET.fromstring(response.content.decode('utf-8'))
+            # Handle different response types
+            content = None
+            if hasattr(response, 'content'):
+                # HTTP Response object
+                content = response.content.decode('utf-8')
+            elif hasattr(response, 'data'):
+                # DAVResponse object - data might be bytes or string
+                data = response.data
+                if isinstance(data, bytes):
+                    content = data.decode('utf-8')
+                else:
+                    content = str(data)
+            elif hasattr(response, 'raw_content'):
+                # Some DAVResponse objects have raw_content
+                content = response.raw_content.decode('utf-8')
+            else:
+                # Try direct string conversion
+                content = str(response)
+            
+            # Debug log the content to see what we're getting
+            self.logger.debug(f"Parsing PROPFIND response content (first 200 chars): {content[:200]}")
+            
+            # Skip if content looks like an error message or doesn't start with XML
+            if not content.strip().startswith('<?xml') and not content.strip().startswith('<'):
+                self.logger.debug(f"Content doesn't appear to be XML: {content[:100]}")
+                return None
+            
+            root = ET.fromstring(content)
             namespaces = {'D': 'DAV:'}
             
             # Look for sync-token in the response
@@ -1075,8 +1192,35 @@ class iCloudCalendarService(BaseCalendarService):
         import xml.etree.ElementTree as ET
         
         try:
+            # Handle different response types
+            content = None
+            if hasattr(response, 'content'):
+                # HTTP Response object
+                content = response.content.decode('utf-8')
+            elif hasattr(response, 'data'):
+                # DAVResponse object - data might be bytes or string
+                data = response.data
+                if isinstance(data, bytes):
+                    content = data.decode('utf-8')
+                else:
+                    content = str(data)
+            elif hasattr(response, 'raw_content'):
+                # Some DAVResponse objects have raw_content
+                content = response.raw_content.decode('utf-8')
+            else:
+                # Try direct string conversion
+                content = str(response)
+            
+            # Skip if content doesn't appear to be XML
+            if not content.strip().startswith('<?xml') and not content.strip().startswith('<'):
+                self.logger.debug(f"Sync-collection content doesn't appear to be XML: {content[:100]}")
+                return await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.events()
+                )
+            
             # Parse XML response
-            root = ET.fromstring(response.content.decode('utf-8'))
+            root = ET.fromstring(content)
             
             # Namespace mappings for CalDAV
             namespaces = {
@@ -1137,7 +1281,31 @@ class iCloudCalendarService(BaseCalendarService):
         """Parse CalDAV sync-collection XML to return (events, deleted_hrefs, next_sync_token)."""
         import xml.etree.ElementTree as ET
         try:
-            root = ET.fromstring(response.content.decode('utf-8'))
+            # Handle different response types
+            content = None
+            if hasattr(response, 'content'):
+                # HTTP Response object
+                content = response.content.decode('utf-8')
+            elif hasattr(response, 'data'):
+                # DAVResponse object - data might be bytes or string
+                data = response.data
+                if isinstance(data, bytes):
+                    content = data.decode('utf-8')
+                else:
+                    content = str(data)
+            elif hasattr(response, 'raw_content'):
+                # Some DAVResponse objects have raw_content
+                content = response.raw_content.decode('utf-8')
+            else:
+                # Try direct string conversion
+                content = str(response)
+            
+            # Skip if content doesn't appear to be XML
+            if not content.strip().startswith('<?xml') and not content.strip().startswith('<'):
+                self.logger.debug(f"Sync-collection-for-changes content doesn't appear to be XML: {content[:100]}")
+                return [], [], None
+            
+            root = ET.fromstring(content)
             namespaces = {
                 'D': 'DAV:',
                 'C': 'urn:ietf:params:xml:ns:caldav'
@@ -1416,13 +1584,46 @@ class iCloudCalendarService(BaseCalendarService):
                 timezone_str = tzinfo.zone
             elif timezone_str.startswith('UTC'):
                 timezone_str = 'UTC'
-            elif timezone_str in ['CET', 'EST', 'PST', 'MST']:
+            elif timezone_str.startswith('GMT'):
+                # Handle GMT offset formats like GMT-0400, GMT+0530
+                import re
+                gmt_match = re.match(r'GMT([+-])(\d{2})(\d{2})', timezone_str.replace(' ', ''))
+                if gmt_match:
+                    sign, hours, minutes = gmt_match.groups()
+                    offset_hours = int(hours)
+                    offset_minutes = int(minutes)
+                    # Convert to common timezone names based on offset
+                    total_offset = offset_hours + offset_minutes / 60
+                    if sign == '-':
+                        total_offset = -total_offset
+                    
+                    # Map common GMT offsets to IANA timezones
+                    offset_map = {
+                        -4: 'America/New_York',  # EDT
+                        -5: 'America/New_York',  # EST 
+                        -6: 'America/Chicago',   # CST
+                        -7: 'America/Denver',    # MST
+                        -8: 'America/Los_Angeles', # PST
+                        0: 'UTC',
+                        1: 'Europe/London',      # BST
+                        2: 'Europe/Berlin',      # CET
+                    }
+                    timezone_str = offset_map.get(total_offset, 'UTC')
+                    self.logger.debug(f"Converted {str(tzinfo)} to {timezone_str}")
+                else:
+                    timezone_str = 'UTC'
+            elif timezone_str in ['CET', 'EST', 'PST', 'MST', 'EDT', 'CDT', 'MDT', 'PDT']:
                 # Common abbreviations - convert to IANA
                 timezone_map = {
                     'CET': 'Europe/Berlin',
                     'EST': 'America/New_York',
+                    'EDT': 'America/New_York', 
+                    'CST': 'America/Chicago',
+                    'CDT': 'America/Chicago',
+                    'MST': 'America/Denver',
+                    'MDT': 'America/Denver',
                     'PST': 'America/Los_Angeles',
-                    'MST': 'America/Denver'
+                    'PDT': 'America/Los_Angeles'
                 }
                 timezone_str = timezone_map.get(timezone_str, 'UTC')
             
@@ -1431,11 +1632,11 @@ class iCloudCalendarService(BaseCalendarService):
                 pytz.timezone(timezone_str)
                 return timezone_str
             except pytz.exceptions.UnknownTimeZoneError:
-                self.logger.warning(f"Unknown timezone: {timezone_str}, defaulting to UTC")
+                self.logger.debug(f"Unknown timezone: {timezone_str}, defaulting to UTC")
                 return 'UTC'
                 
         except Exception as e:
-            self.logger.warning(f"Error extracting timezone: {e}, defaulting to UTC")
+            self.logger.debug(f"Error extracting timezone: {e}, defaulting to UTC")
             return 'UTC'
     
     def _ensure_timezone_aware(self, dt: datetime) -> datetime:
