@@ -1142,7 +1142,34 @@ class iCloudCalendarService(BaseCalendarService):
         import xml.etree.ElementTree as ET
         
         try:
-            root = ET.fromstring(response.content.decode('utf-8'))
+            # Handle different response types
+            content = None
+            if hasattr(response, 'content'):
+                # HTTP Response object
+                content = response.content.decode('utf-8')
+            elif hasattr(response, 'data'):
+                # DAVResponse object - data might be bytes or string
+                data = response.data
+                if isinstance(data, bytes):
+                    content = data.decode('utf-8')
+                else:
+                    content = str(data)
+            elif hasattr(response, 'raw_content'):
+                # Some DAVResponse objects have raw_content
+                content = response.raw_content.decode('utf-8')
+            else:
+                # Try direct string conversion
+                content = str(response)
+            
+            # Debug log the content to see what we're getting
+            self.logger.debug(f"Parsing PROPFIND response content (first 200 chars): {content[:200]}")
+            
+            # Skip if content looks like an error message or doesn't start with XML
+            if not content.strip().startswith('<?xml') and not content.strip().startswith('<'):
+                self.logger.debug(f"Content doesn't appear to be XML: {content[:100]}")
+                return None
+            
+            root = ET.fromstring(content)
             namespaces = {'D': 'DAV:'}
             
             # Look for sync-token in the response
@@ -1165,8 +1192,35 @@ class iCloudCalendarService(BaseCalendarService):
         import xml.etree.ElementTree as ET
         
         try:
+            # Handle different response types
+            content = None
+            if hasattr(response, 'content'):
+                # HTTP Response object
+                content = response.content.decode('utf-8')
+            elif hasattr(response, 'data'):
+                # DAVResponse object - data might be bytes or string
+                data = response.data
+                if isinstance(data, bytes):
+                    content = data.decode('utf-8')
+                else:
+                    content = str(data)
+            elif hasattr(response, 'raw_content'):
+                # Some DAVResponse objects have raw_content
+                content = response.raw_content.decode('utf-8')
+            else:
+                # Try direct string conversion
+                content = str(response)
+            
+            # Skip if content doesn't appear to be XML
+            if not content.strip().startswith('<?xml') and not content.strip().startswith('<'):
+                self.logger.debug(f"Sync-collection content doesn't appear to be XML: {content[:100]}")
+                return await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: calendar.events()
+                )
+            
             # Parse XML response
-            root = ET.fromstring(response.content.decode('utf-8'))
+            root = ET.fromstring(content)
             
             # Namespace mappings for CalDAV
             namespaces = {
@@ -1227,7 +1281,31 @@ class iCloudCalendarService(BaseCalendarService):
         """Parse CalDAV sync-collection XML to return (events, deleted_hrefs, next_sync_token)."""
         import xml.etree.ElementTree as ET
         try:
-            root = ET.fromstring(response.content.decode('utf-8'))
+            # Handle different response types
+            content = None
+            if hasattr(response, 'content'):
+                # HTTP Response object
+                content = response.content.decode('utf-8')
+            elif hasattr(response, 'data'):
+                # DAVResponse object - data might be bytes or string
+                data = response.data
+                if isinstance(data, bytes):
+                    content = data.decode('utf-8')
+                else:
+                    content = str(data)
+            elif hasattr(response, 'raw_content'):
+                # Some DAVResponse objects have raw_content
+                content = response.raw_content.decode('utf-8')
+            else:
+                # Try direct string conversion
+                content = str(response)
+            
+            # Skip if content doesn't appear to be XML
+            if not content.strip().startswith('<?xml') and not content.strip().startswith('<'):
+                self.logger.debug(f"Sync-collection-for-changes content doesn't appear to be XML: {content[:100]}")
+                return [], [], None
+            
+            root = ET.fromstring(content)
             namespaces = {
                 'D': 'DAV:',
                 'C': 'urn:ietf:params:xml:ns:caldav'

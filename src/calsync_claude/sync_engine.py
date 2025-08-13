@@ -1328,9 +1328,9 @@ class SyncEngine:
                 
                 if is_likely_override:
                     # This is likely a true orphaned override - log it but treat as standalone
-                    self.logger.warning(f"Orphaned recurrence override event: {override_event.id}")
-                    self.logger.info(f"  📋 Event '{override_event.summary}' (UID: {override_event.uid}) is a genuine recurrence exception")
-                    self.logger.info(f"  🔍 Master event missing or not synced yet - converting to standalone event")
+                    self.logger.debug(f"Orphaned recurrence override event: {override_event.id}")
+                    self.logger.debug(f"  📋 Event '{override_event.summary}' (UID: {override_event.uid}) is a genuine recurrence exception")
+                    self.logger.debug(f"  🔍 Master event missing or not synced yet - converting to standalone event")
                     
                     # Additional debug info for genuine orphans
                     if override_event.recurrence_overrides:

@@ -557,19 +557,46 @@ class GoogleCalendarService(BaseCalendarService):
                             self.logger.error(f"UID search also failed: {search_error}")
             
             elif e.resp.status == 409 and "duplicate" in str(e).lower():
-                # 409 Duplicate - handle same way as above
-                self.logger.warning(f"🔄 409 Duplicate error - attempting to update existing event")
+                # 409 Duplicate - try to find and return the existing event
+                self.logger.debug(f"🔄 409 Duplicate error - finding existing event for {event_data.summary}")
                 if event_data.uid:
                     try:
+                        # Try to find existing event by UID
+                        existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
+                        if existing_events:
+                            self.logger.debug(f"✅ Found existing event by UID, returning it")
+                            return self._format_google_event(existing_events[0])
+                        
+                        # Try deterministic ID lookup
                         deterministic_id = self._generate_compliant_event_id(event_data.uid)
-                        return await self.update_event(validated_calendar_id, deterministic_id, event_data)
-                    except:
                         try:
-                            existing_events = await self._find_events_by_uid(validated_calendar_id, event_data.uid)
-                            if existing_events:
-                                return await self.update_event(validated_calendar_id, existing_events[0]['id'], event_data)
-                        except Exception as search_error:
-                            self.logger.error(f"UID search failed: {search_error}")
+                            existing = await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: self.service.events().get(
+                                    calendarId=validated_calendar_id,
+                                    eventId=deterministic_id
+                                ).execute()
+                            )
+                            self.logger.debug(f"✅ Found existing event by deterministic ID, returning it")
+                            return self._format_google_event(existing)
+                        except:
+                            pass
+                            
+                    except Exception as search_error:
+                        self.logger.debug(f"UID search failed: {search_error}")
+                
+                # Try content-based search as fallback
+                try:
+                    existing_events = await self._find_events_by_content(validated_calendar_id, event_data)
+                    if existing_events:
+                        self.logger.debug(f"✅ Found existing event by content, returning it")
+                        return self._format_google_event(existing_events[0])
+                except Exception as content_error:
+                    self.logger.debug(f"Content search failed: {content_error}")
+                
+                # If all fails, log and skip instead of raising error
+                self.logger.warning(f"⚠️ 409 duplicate but couldn't find existing event for '{event_data.summary}', skipping")
+                return None
             
             self.logger.error(f"❌ Create event failed with validated_calendar_id={validated_calendar_id}, error: {e}")
             raise CalendarServiceError(f"Failed to create Google event: {e}")
