@@ -1,0 +1,38 @@
+# Development Docker Compose - For local testing
+# Uses .env file for easier credential management during development
+services:
+  calsync-dev:
+    build: .
+    container_name: calsync-claude-dev
+    restart: "no"  # Don't auto-restart during development
+    env_file:
+      - .env  # Load from .env file for convenience
+    environment:
+      # Override some settings for development
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - DEBUG=${DEBUG:-true}
+      - SYNC_CONFIG__SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-3}  # Faster sync for testing
+      - SYNC_CONFIG__MAX_EVENTS_PER_SYNC=${MAX_EVENTS_PER_SYNC:-100}     # Smaller batches for testing
+      - SYNC_CONFIG__SYNC_PAST_DAYS=${SYNC_PAST_DAYS:-7}                 # Shorter timespan for testing
+      - SYNC_CONFIG__SYNC_FUTURE_DAYS=${SYNC_FUTURE_DAYS:-30}            # Shorter timespan for testing
+    volumes:
+      - ./data:/data
+      - ./credentials:/credentials
+      # Optional: Mount source code for live development (uncomment if needed)
+      # - ./src:/app/src:ro  # Read-only source mount for debugging
+    command: ['daemon']
+
+  # Alternative service for one-off sync testing
+  calsync-test:
+    build: .
+    container_name: calsync-claude-test
+    profiles: ["test"]  # Only start when explicitly requested
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=DEBUG
+      - DEBUG=true
+    volumes:
+      - ./data:/data
+      - ./credentials:/credentials
+    command: ['sync', '--dry-run']  # Safe dry-run for testing
