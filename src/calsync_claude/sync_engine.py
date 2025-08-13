@@ -681,6 +681,30 @@ class SyncEngine:
             target_events_by_uid: Target events indexed by UID
         """
         try:
+            # CRITICAL FIX: Validate event data before attempting sync
+            # Skip events with invalid data to prevent sync failures
+            if not source_event.summary:
+                self.logger.debug(f"Skipping event with empty summary: {source_event.id}")
+                await self._record_sync_operation(
+                    sync_session, sync_report, SyncOperation.SKIP,
+                    source_event.source, target_source, source_event.id,
+                    "(empty summary)", False, error="Event has no summary"
+                )
+                return
+            
+            # Validate start/end times
+            if source_event.end <= source_event.start:
+                self.logger.warning(
+                    f"Skipping event '{source_event.summary}' with invalid times: "
+                    f"start={source_event.start}, end={source_event.end}"
+                )
+                await self._record_sync_operation(
+                    sync_session, sync_report, SyncOperation.SKIP,
+                    source_event.source, target_source, source_event.id,
+                    source_event.summary, False, error="Invalid start/end times"
+                )
+                return
+            
             target_service = (
                 self.icloud_service if target_source == EventSource.ICLOUD 
                 else self.google_service
@@ -874,8 +898,20 @@ class SyncEngine:
                 except:
                     pass
             
-            self.logger.error(f"❌ Failed to sync event {source_event.id}: {error_type}: {error_details}")
-            self.logger.error(f"   📝 Event: '{source_event.summary}' ({source_event.source.value} → {target_source.value})")
+            # Check if this is a validation error that we should handle more gracefully
+            if "validation error" in error_details.lower() or "value error" in error_details.lower():
+                self.logger.warning(
+                    f"Validation error for event '{source_event.summary}': {error_details}. "
+                    f"This event will be skipped due to invalid data."
+                )
+            elif "412" in error_details or "precondition" in error_details.lower():
+                self.logger.warning(
+                    f"Precondition failed for event '{source_event.summary}': {error_details}. "
+                    f"This usually indicates the event already exists or has conflicts."
+                )
+            else:
+                self.logger.error(f"❌ Failed to sync event {source_event.id}: {error_type}: {error_details}")
+                self.logger.error(f"   📝 Event: '{source_event.summary}' ({source_event.source.value} → {target_source.value})")
             
             await self._record_sync_operation(
                 sync_session, sync_report, SyncOperation.CREATE if not mapping else SyncOperation.UPDATE,
