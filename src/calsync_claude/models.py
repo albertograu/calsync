@@ -83,6 +83,7 @@ class CalendarEvent(BaseModel):
         import hashlib
         import json
         
+        # Include all fields that should trigger a sync when changed
         content = {
             'uid': self.uid,
             'summary': self.summary,
@@ -93,6 +94,9 @@ class CalendarEvent(BaseModel):
             'all_day': self.all_day,
             'timezone': self.timezone,
             'recurrence_rule': self.recurrence_rule,
+            # Include attendees and organizer to detect meeting changes
+            'organizer': json.dumps(self.organizer, sort_keys=True) if self.organizer else None,
+            'attendees': json.dumps(self.attendees, sort_keys=True) if self.attendees else [],
         }
         content_str = json.dumps(content, sort_keys=True)
         return hashlib.sha256(content_str.encode()).hexdigest()

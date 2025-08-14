@@ -547,9 +547,28 @@ class SyncEngine:
             # Expunge all objects from session so they can be used outside the session
             for mapping in existing_mappings:
                 session.expunge(mapping)
+            
+            # ALSO get all mappings by event ID to detect calendar moves
+            # This allows us to find events that moved from other calendar pairs
+            all_google_mappings = session.query(EventMappingDB).filter(
+                EventMappingDB.google_event_id.in_(list(google_events.keys()))
+            ).all() if google_events else []
+            
+            all_icloud_mappings = session.query(EventMappingDB).filter(
+                EventMappingDB.icloud_event_id.in_(list(icloud_events.keys()))
+            ).all() if icloud_events else []
+            
+            for mapping in all_google_mappings + all_icloud_mappings:
+                session.expunge(mapping)
         
         mappings_by_google = {m.google_event_id: m for m in existing_mappings if m.google_event_id}
         mappings_by_icloud = {m.icloud_event_id: m for m in existing_mappings if m.icloud_event_id}
+        
+        # Track events that moved from other calendars
+        moved_google_mappings = {m.google_event_id: m for m in all_google_mappings 
+                                if m.calendar_mapping_id != calendar_mapping.id}
+        moved_icloud_mappings = {m.icloud_event_id: m for m in all_icloud_mappings 
+                                if m.calendar_mapping_id != calendar_mapping.id}
         
         # Track processed events
         processed_google = set()
@@ -574,7 +593,8 @@ class SyncEngine:
                     await self._sync_event_to_target(
                         master_event, EventSource.ICLOUD, icloud_calendar_id,
                         calendar_mapping, mappings_by_google, sync_session, sync_report, dry_run,
-                        target_events_by_uid=icloud_events_by_uid
+                        target_events_by_uid=icloud_events_by_uid,
+                        moved_mappings=moved_google_mappings
                     )
                 processed_google.add(master_event.id)
                 
@@ -585,7 +605,8 @@ class SyncEngine:
                             await self._sync_event_to_target(
                                 override_event, EventSource.ICLOUD, icloud_calendar_id,
                                 calendar_mapping, mappings_by_google, sync_session, sync_report, dry_run,
-                                target_events_by_uid=icloud_events_by_uid
+                                target_events_by_uid=icloud_events_by_uid,
+                                moved_mappings=moved_google_mappings
                             )
                         processed_google.add(override_event.id)
         
@@ -603,7 +624,8 @@ class SyncEngine:
                     await self._sync_event_to_target(
                         master_event, EventSource.GOOGLE, google_calendar_id,
                         calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run,
-                        target_events_by_uid=google_events_by_uid
+                        target_events_by_uid=google_events_by_uid,
+                        moved_mappings=moved_icloud_mappings
                     )
                 processed_icloud.add(master_event.id)
                 
@@ -635,7 +657,8 @@ class SyncEngine:
                             await self._sync_event_to_target(
                                 override_event, EventSource.GOOGLE, google_calendar_id,
                                 calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run,
-                                target_events_by_uid=google_events_by_uid
+                                target_events_by_uid=google_events_by_uid,
+                                moved_mappings=moved_icloud_mappings
                             )
                         processed_icloud.add(override_event.id)
         
@@ -665,7 +688,8 @@ class SyncEngine:
         sync_session: SyncSessionDB,
         sync_report: SyncReport,
         dry_run: bool,
-        target_events_by_uid: Optional[Dict[str, CalendarEvent]] = None
+        target_events_by_uid: Optional[Dict[str, CalendarEvent]] = None,
+        moved_mappings: Optional[Dict[str, EventMappingDB]] = None
     ) -> None:
         """Sync a single event to the target service.
         
@@ -679,6 +703,7 @@ class SyncEngine:
             sync_report: Sync report to update
             dry_run: Whether this is a dry run
             target_events_by_uid: Target events indexed by UID
+            moved_mappings: Mappings for events that moved from other calendar pairs
         """
         try:
             # CRITICAL FIX: Validate event data before attempting sync
@@ -712,6 +737,86 @@ class SyncEngine:
             
             mapping = mappings.get(source_event.id)
             content_hash = source_event.content_hash()
+            
+            # Check if event moved from another calendar
+            # This can happen in two cases:
+            # 1. Event has no mapping in current calendar pair but exists in moved_mappings
+            # 2. Event has a mapping but it's for a different calendar pair (detected via moved_mappings)
+            moved_mapping = moved_mappings.get(source_event.id) if moved_mappings else None
+            
+            if moved_mapping and (not mapping or mapping.calendar_mapping_id != calendar_mapping.id):
+                self.logger.info(
+                    f"Event '{source_event.summary}' moved from another calendar pair. "
+                    f"Deleting from old calendar and creating in new calendar."
+                )
+                
+                # Delete the event from the OLD target calendar
+                old_target_event_id = (
+                    moved_mapping.icloud_event_id if target_source == EventSource.ICLOUD
+                    else moved_mapping.google_event_id
+                )
+                old_target_calendar_id = (
+                    moved_mapping.icloud_calendar_id if target_source == EventSource.ICLOUD
+                    else moved_mapping.google_calendar_id
+                )
+                
+                if old_target_event_id and old_target_calendar_id and not dry_run:
+                    try:
+                        # Delete from old calendar
+                        await target_service.delete_event(old_target_calendar_id, old_target_event_id)
+                        self.logger.info(
+                            f"Deleted event '{source_event.summary}' from old calendar {old_target_calendar_id}"
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Failed to delete moved event from old calendar: {e}"
+                        )
+                
+                # Create event in the new calendar immediately
+                if not dry_run:
+                    created_event = await target_service.create_event(
+                        target_calendar_id, source_event
+                    )
+                    self.logger.info(
+                        f"Created event '{source_event.summary}' in new calendar {target_calendar_id}"
+                    )
+                    
+                    # Update the mapping to the new calendar pair with new event ID
+                    with self.db_manager.get_session() as session:
+                        # Update mapping with new calendar IDs and event ID
+                        moved_mapping.calendar_mapping_id = calendar_mapping.id
+                        moved_mapping.google_calendar_id = calendar_mapping.google_calendar_id
+                        moved_mapping.icloud_calendar_id = calendar_mapping.icloud_calendar_id
+                        # Set the new target event ID
+                        if target_source == EventSource.ICLOUD:
+                            moved_mapping.icloud_event_id = created_event.id
+                            moved_mapping.icloud_etag = created_event.etag
+                            moved_mapping.icloud_sequence = created_event.sequence or 0
+                        else:
+                            moved_mapping.google_event_id = created_event.id
+                            moved_mapping.google_etag = created_event.etag
+                            moved_mapping.google_sequence = created_event.sequence or 0
+                        moved_mapping.content_hash = content_hash
+                        moved_mapping.sync_direction = f"{source_event.source.value}_to_{target_source.value}"
+                        moved_mapping.last_sync_at = datetime.now(pytz.UTC)
+                        moved_mapping.updated_at = datetime.now(pytz.UTC)
+                        session.merge(moved_mapping)
+                        session.commit()
+                
+                # Record the operations
+                await self._record_sync_operation(
+                    sync_session, sync_report, SyncOperation.DELETE,
+                    source_event.source, target_source, old_target_event_id,
+                    source_event.summary, True, mapping=moved_mapping
+                )
+                await self._record_sync_operation(
+                    sync_session, sync_report, SyncOperation.CREATE,
+                    source_event.source, target_source, source_event.id,
+                    source_event.summary, True, mapping=moved_mapping
+                )
+                
+                # Return early since we've handled the move completely
+                return
             
             if mapping:
                 # Check if content has changed
@@ -771,6 +876,41 @@ class SyncEngine:
                             source_event.source, target_source, source_event.id,
                             source_event.summary, False, error=str(e), mapping=mapping
                         )
+                else:
+                    # No target event ID - this happens when event moved calendars
+                    # Create event in the new calendar
+                    if not dry_run:
+                        created_event = await target_service.create_event(
+                            target_calendar_id, source_event
+                        )
+                        
+                        # Update the existing mapping with the new event ID
+                        with self.db_manager.get_session() as session:
+                            if target_source == EventSource.ICLOUD:
+                                mapping.icloud_event_id = created_event.id
+                                mapping.icloud_etag = created_event.etag
+                                mapping.icloud_sequence = created_event.sequence or 0
+                            else:
+                                mapping.google_event_id = created_event.id
+                                mapping.google_etag = created_event.etag
+                                mapping.google_sequence = created_event.sequence or 0
+                            
+                            mapping.content_hash = content_hash
+                            mapping.sync_direction = f"{source_event.source.value}_to_{target_source.value}"
+                            mapping.last_sync_at = datetime.now(pytz.UTC)
+                            mapping.updated_at = datetime.now(pytz.UTC)
+                            session.merge(mapping)
+                            session.commit()
+                        
+                        self.logger.info(
+                            f"Created event '{source_event.summary}' in new calendar {target_calendar_id}"
+                        )
+                    
+                    await self._record_sync_operation(
+                        sync_session, sync_report, SyncOperation.CREATE,
+                        source_event.source, target_source, source_event.id,
+                        source_event.summary, True, mapping=mapping
+                    )
             else:
                 # Create new event - SPECIAL HANDLING FOR RECURRENCE EXCEPTIONS
                 if not dry_run:
