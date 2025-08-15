@@ -459,12 +459,3 @@ MIT License - see [LICENSE](LICENSE) file for details.
 5. Commit your changes (`git commit -m 'Add amazing feature'`)
 6. Push to the branch (`git push origin feature/amazing-feature`)
 7. Open a Pull Request
-
-## 📞 Support
-
-- 🐛 [Report Issues](https://github.com/your-username/calsync-claude/issues)
-- 💡 [Feature Requests](https://github.com/your-username/calsync-claude/discussions)
-- 📖 [Documentation](https://github.com/your-username/calsync-claude/wiki)
----
-
-**CalSync Claude** - Powered by modern Python, designed for reliability, built for the future. 🚀
