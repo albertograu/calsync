@@ -309,6 +309,8 @@ pre-commit install
 
 ### Running Tests
 
+The test suite uses **pytest** and can be executed locally or within the project's Docker environment.
+
 ```bash
 # Run all tests
 pytest
@@ -316,8 +318,23 @@ pytest
 # Run with coverage
 pytest --cov=src/calsync_claude --cov-report=html
 
-# Run specific test file
+# Run a specific test module
 pytest tests/test_sync_engine.py
+
+# Run the sync reflection tests
+pytest tests/test_sync_reflection.py -q
+```
+
+#### Run Tests in Docker
+
+If you're using the provided Docker setup, run tests inside the container to ensure a consistent environment:
+
+```bash
+# Run the full test suite in Docker
+docker compose run --rm calsync pytest
+
+# Run only the sync reflection tests in Docker
+docker compose run --rm calsync pytest tests/test_sync_reflection.py -q
 ```
 
 ### Code Quality
