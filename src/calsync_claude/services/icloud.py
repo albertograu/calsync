@@ -1174,22 +1174,45 @@ class iCloudCalendarService(BaseCalendarService):
         try:
             # Handle different response types
             content = None
-            if hasattr(response, 'content'):
-                # HTTP Response object
-                content = response.content.decode('utf-8')
-            elif hasattr(response, 'data'):
-                # DAVResponse object - data might be bytes or string
+            
+            # Handle DAVResponse objects from caldav library
+            if hasattr(response, '_raw') and response._raw:
+                # DAVResponse with _raw content (can be bytes or str)
+                if isinstance(response._raw, bytes):
+                    content = response._raw.decode('utf-8')
+                else:
+                    content = str(response._raw)
+            elif hasattr(response, 'raw') and hasattr(response.raw, 'decode'):
+                # DAVResponse with raw bytes content
+                content = response.raw.decode('utf-8')
+            elif hasattr(response, 'data') and response.data:
+                # DAVResponse with data attribute
                 data = response.data
                 if isinstance(data, bytes):
                     content = data.decode('utf-8')
+                elif isinstance(data, str):
+                    content = data
                 else:
                     content = str(data)
+            elif hasattr(response, 'content'):
+                # HTTP response with content
+                if isinstance(response.content, bytes):
+                    content = response.content.decode('utf-8')
+                else:
+                    content = str(response.content)
+            elif hasattr(response, 'text'):
+                # HTTP response with text
+                content = response.text
             elif hasattr(response, 'raw_content'):
                 # Some DAVResponse objects have raw_content
                 content = response.raw_content.decode('utf-8')
             else:
-                # Try direct string conversion
-                content = str(response)
+                # Last resort - try to convert to string
+                content_str = str(response)
+                if 'DAVResponse object' in content_str:
+                    self.logger.error("Received DAVResponse object but cannot extract content")
+                    return None
+                content = content_str
             
             # Debug log the content to see what we're getting
             self.logger.debug(f"Parsing PROPFIND response content (first 200 chars): {content[:200]}")
@@ -1307,28 +1330,137 @@ class iCloudCalendarService(BaseCalendarService):
                 lambda: calendar.events()
             )
 
+    async def _parse_sync_collection_token(self, response) -> Optional[str]:
+        """Parse sync token from sync-collection REPORT response according to RFC 6578."""
+        import xml.etree.ElementTree as ET
+        
+        try:
+            # Extract content with robust error handling
+            content = None
+            encoding = 'utf-8'
+            
+            # Handle DAVResponse objects from caldav library
+            if hasattr(response, '_raw') and response._raw:
+                # DAVResponse with _raw content (can be bytes or str)
+                if isinstance(response._raw, bytes):
+                    content = response._raw.decode('utf-8')
+                else:
+                    content = str(response._raw)
+            elif hasattr(response, 'raw') and hasattr(response.raw, 'decode'):
+                # DAVResponse with raw bytes content
+                content = response.raw.decode('utf-8')
+            elif hasattr(response, 'data') and response.data:
+                # DAVResponse with data attribute
+                data = response.data
+                if isinstance(data, bytes):
+                    content = data.decode('utf-8')
+                elif isinstance(data, str):
+                    content = data
+                else:
+                    content = str(data)
+            elif hasattr(response, 'content'):
+                # HTTP response with content
+                raw_content = response.content
+                if isinstance(raw_content, bytes):
+                    try:
+                        content = raw_content.decode('utf-8')
+                    except UnicodeDecodeError:
+                        content = raw_content.decode('latin1')
+                else:
+                    content = str(raw_content)
+            elif hasattr(response, 'text'):
+                # HTTP response with text
+                content = response.text
+            else:
+                # Last resort - try to convert to string
+                content_str = str(response)
+                if 'DAVResponse object' in content_str:
+                    self.logger.error("Received DAVResponse object but cannot extract content")
+                    return None
+                content = content_str
+            
+            if not content or not content.strip():
+                self.logger.warning("Empty sync-collection response")
+                return None
+            
+            # Debug log the content
+            self.logger.debug(f"Parsing sync-collection response (first 300 chars): {content[:300]}")
+            
+            # Clean and parse XML
+            content = content.strip()
+            if not content.startswith('<?xml') and not content.startswith('<'):
+                self.logger.warning(f"Response doesn't appear to be XML: {content[:100]}")
+                return None
+            
+            root = ET.fromstring(content)
+            
+            # RFC 6578: Look for DAV:sync-token in multistatus response
+            namespaces = {
+                'D': 'DAV:',
+                'C': 'urn:ietf:params:xml:ns:caldav'
+            }
+            
+            # The sync-token should be at the root level of the multistatus
+            sync_token_elem = root.find('.//D:sync-token', namespaces)
+            if sync_token_elem is not None and sync_token_elem.text:
+                token = sync_token_elem.text.strip()
+                self.logger.info(f"📊 Extracted sync-collection token: {token[:50]}...")
+                return token
+            
+            self.logger.warning("No DAV:sync-token found in sync-collection response")
+            return None
+            
+        except ET.ParseError as e:
+            self.logger.error(f"Failed to parse sync-collection XML: {e}")
+            self.logger.error(f"Content that failed to parse: {content[:500] if content else 'None'}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected error parsing sync-collection token: {e}")
+            return None
+
     async def _parse_sync_collection_for_changes(self, response, calendar):
         """Parse CalDAV sync-collection XML to return (events, deleted_hrefs, next_sync_token)."""
         import xml.etree.ElementTree as ET
         try:
             # Handle different response types
             content = None
-            if hasattr(response, 'content'):
-                # HTTP Response object
-                content = response.content.decode('utf-8')
-            elif hasattr(response, 'data'):
-                # DAVResponse object - data might be bytes or string
+            
+            # Handle DAVResponse objects from caldav library
+            if hasattr(response, '_raw') and response._raw:
+                # DAVResponse with _raw content (can be bytes or str)
+                if isinstance(response._raw, bytes):
+                    content = response._raw.decode('utf-8')
+                else:
+                    content = str(response._raw)
+            elif hasattr(response, 'raw') and hasattr(response.raw, 'decode'):
+                # DAVResponse with raw bytes content
+                content = response.raw.decode('utf-8')
+            elif hasattr(response, 'data') and response.data:
+                # DAVResponse with data attribute
                 data = response.data
                 if isinstance(data, bytes):
                     content = data.decode('utf-8')
                 else:
                     content = str(data)
+            elif hasattr(response, 'content'):
+                # HTTP Response object
+                if isinstance(response.content, bytes):
+                    content = response.content.decode('utf-8')
+                else:
+                    content = str(response.content)
+            elif hasattr(response, 'text'):
+                # HTTP response with text
+                content = response.text
             elif hasattr(response, 'raw_content'):
                 # Some DAVResponse objects have raw_content
                 content = response.raw_content.decode('utf-8')
             else:
-                # Try direct string conversion
-                content = str(response)
+                # Last resort - try to convert to string
+                content_str = str(response)
+                if 'DAVResponse object' in content_str:
+                    self.logger.error("Received DAVResponse object but cannot extract content for change parsing")
+                    return [], [], None
+                content = content_str
             
             # Skip if content doesn't appear to be XML
             if not content.strip().startswith('<?xml') and not content.strip().startswith('<'):
@@ -1435,7 +1567,10 @@ class iCloudCalendarService(BaseCalendarService):
                 else:
                     self.logger.warning("📊 Strategy 1: No sync token in PROPFIND response, trying sync-collection")
             except Exception as e1:
-                self.logger.warning(f"📊 Strategy 1 FAILED: {e1}")
+                self.logger.error(f"📊 Strategy 1 FAILED: {type(e1).__name__}: {e1}")
+                if hasattr(e1, 'response'):
+                    self.logger.error(f"📊 Response status: {getattr(e1.response, 'status', 'Unknown')}")
+                    self.logger.error(f"📊 Response text: {getattr(e1.response, 'text', 'No text')[:500]}")
             
             # STRATEGY 2: Try sync-collection without initial token (RFC 6578 compliant)
             try:
@@ -1447,6 +1582,7 @@ class iCloudCalendarService(BaseCalendarService):
                         "REPORT",
                         """<?xml version="1.0" encoding="utf-8"?>
 <D:sync-collection xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:sync-token/>
   <D:sync-level>1</D:sync-level>
   <D:prop>
     <D:getetag/>
@@ -1455,18 +1591,23 @@ class iCloudCalendarService(BaseCalendarService):
 </D:sync-collection>""",
                         headers={
                             "Content-Type": "application/xml; charset=utf-8",
-                            "Depth": "1"
+                            "User-Agent": "CalSync/2.0 (CalDAV Client)",
+                            "Accept": "application/xml, text/xml"
                         }
                     )
                 )
-                _events, _deleted, next_token = await self._parse_sync_collection_for_changes(response, calendar)
-                if next_token:
-                    self.logger.info(f"🎯 Strategy 2 SUCCESS: Sync-collection token: {next_token[:20]}...")
-                    return next_token
+                # Parse sync-collection response for new sync-token
+                sync_token = await self._parse_sync_collection_token(response)
+                if sync_token:
+                    self.logger.info(f"🎯 Strategy 2 SUCCESS: Sync-collection token: {sync_token[:50]}...")
+                    return sync_token
                 else:
-                    self.logger.warning("📊 Strategy 2: No sync token in response, trying CTag fallback")
+                    self.logger.warning("📊 Strategy 2: No sync token in sync-collection response, trying CTag fallback")
             except Exception as e2:
-                self.logger.warning(f"📊 Strategy 2 FAILED: {e2}")
+                self.logger.error(f"📊 Strategy 2 FAILED: {type(e2).__name__}: {e2}")
+                if hasattr(e2, 'response'):
+                    self.logger.error(f"📊 Response status: {getattr(e2.response, 'status', 'Unknown')}")
+                    self.logger.error(f"📊 Response text: {getattr(e2.response, 'text', 'No text')[:500]}")
             
             # STRATEGY 3: Enhanced CTag fallback with better reliability
             try:
