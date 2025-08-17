@@ -6,6 +6,17 @@ from calsync_claude.config import Settings
 from calsync_claude.sync_engine import SyncEngine
 from calsync_claude.models import CalendarEvent, EventSource, SyncReport
 from calsync_claude.database import CalendarMappingDB, EventMappingDB
+from pydantic_settings import SettingsConfigDict
+
+
+class TestSettings(Settings):
+    """Test-specific settings that don't read from .env files."""
+    model_config = SettingsConfigDict(
+        env_file=None,  # Don't read from .env files
+        case_sensitive=False,
+        extra="ignore",
+        secrets_dir=None  # Don't read from secrets directory
+    )
 
 
 class InMemoryService:
@@ -34,11 +45,11 @@ class InMemoryService:
 
 
 def make_settings(tmp_path):
-    return Settings(
+    return TestSettings(
         google_client_id='x'*20,
         google_client_secret='y'*20,
         icloud_username='user@example.com',
-        icloud_password='app-password-123',
+        icloud_password='abcd-efgh-ijkl-mnop',  # Valid app-specific password format
         database_url=f'sqlite:///{tmp_path}/test.db'
     )
 

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 
 import pytz
+from pydantic import ValidationError
 
 from calsync_claude.models import (
     CalendarEvent, EventSource, EventMapping, SyncResult, 
@@ -58,7 +59,7 @@ class TestCalendarEvent:
         start = datetime.now(pytz.UTC)
         end = start - timedelta(hours=1)  # End before start
         
-        with pytest.raises(ValueError, match="End time must be after start time"):
+        with pytest.raises(ValidationError, match=r"End time .* must be after start time"):
             CalendarEvent(
                 id="test-123",
                 source=EventSource.GOOGLE,
