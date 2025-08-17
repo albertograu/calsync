@@ -342,6 +342,7 @@ class iCloudCalendarService(BaseCalendarService):
                     self.logger.info(f"  Calendar URL: {calendar.url if calendar else 'None'}")
                     self.logger.info(f"  Client URL: {getattr(self.client, 'url', 'Unknown')}")
                     self.logger.info(f"  Sync token: {sync_token[:50]}..." if sync_token else "  No sync token")
+                    self.logger.info(f"📤 DEBUG: About to send sync-collection REPORT request")
                     
                     response = await asyncio.get_event_loop().run_in_executor(
                         None,
@@ -365,9 +366,11 @@ class iCloudCalendarService(BaseCalendarService):
                         )
                     )
 
+                    self.logger.info(f"📥 DEBUG: Received sync-collection response, parsing...")
                     # Parse for changes and deletions
                     events, deleted_hrefs, extracted_next = await self._parse_sync_collection_for_changes(response, calendar)
                     next_token = extracted_next
+                    self.logger.info(f"📊 DEBUG: Sync-collection results: {len(events)} events, {len(deleted_hrefs)} deletions, next_token: {extracted_next[:50] if extracted_next else 'None'}...")
 
                     # Turn events into CalendarEvent and key by href
                     for ev in events:
@@ -1481,6 +1484,7 @@ class iCloudCalendarService(BaseCalendarService):
             if token_elem is not None and token_elem.text:
                 next_token = token_elem.text
 
+            event_hrefs_found = []
             for response_elem in root.findall('.//D:response', namespaces):
                 href_elem = response_elem.find('D:href', namespaces)
                 if href_elem is None:
@@ -1490,15 +1494,29 @@ class iCloudCalendarService(BaseCalendarService):
                 status_elem = response_elem.find('.//D:status', namespaces)
                 if status_elem is not None and '404' in status_elem.text:
                     deleted_hrefs.append(href)
+                    self.logger.debug(f"Sync-collection found deleted event: {href}")
                     continue
 
                 calendar_data_elem = response_elem.find('.//C:calendar-data', namespaces)
                 if calendar_data_elem is not None and calendar_data_elem.text:
-                    class MockCalDAVEvent:
-                        def __init__(self, data, url):
-                            self.data = data
-                            self.url = url
-                    events.append(MockCalDAVEvent(calendar_data_elem.text, href))
+                    # Track that we found an event, but we'll get real CalDAV objects
+                    event_hrefs_found.append(href)
+                    self.logger.debug(f"Sync-collection found changed event: {href}")
+
+            # If we found changed events, get real CalDAV events for compatibility
+            # but preserve the deletions from sync-collection
+            if event_hrefs_found:
+                self.logger.info(f"Found {len(event_hrefs_found)} changed events in sync-collection, fetching real CalDAV objects for compatibility")
+                try:
+                    real_events = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: calendar.events()
+                    )
+                    return real_events, deleted_hrefs, next_token
+                except Exception as e:
+                    self.logger.error(f"Failed to fetch real CalDAV events: {e}")
+                    # Fall back to empty events but keep deletions
+                    return [], deleted_hrefs, next_token
 
             return events, deleted_hrefs, next_token
         except Exception as e:
