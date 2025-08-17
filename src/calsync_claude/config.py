@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Optional, List, Set
 
-from pydantic import Field, validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import ConflictResolution, SyncConfiguration, CalendarPair
@@ -105,7 +105,8 @@ class Settings(BaseSettings):
         description="SSL private key for webhooks"
     )
     
-    @validator('data_dir', 'credentials_dir', pre=True)
+    @field_validator('data_dir', 'credentials_dir', mode='before')
+    @classmethod
     def expand_path(cls, v):
         """Expand user paths and convert to Path objects."""
         if v is None:
@@ -114,22 +115,25 @@ class Settings(BaseSettings):
             return Path(v).expanduser().absolute()
         return v.expanduser().absolute()
     
-    @validator('database_url')
-    def set_default_database_url(cls, v, values):
+    @field_validator('database_url')
+    @classmethod
+    def set_default_database_url(cls, v, info):
         """Set default SQLite database URL if not provided."""
-        if not v and 'data_dir' in values:
-            data_dir = values['data_dir']
+        if not v and hasattr(info.data, 'get') and info.data.get('data_dir'):
+            data_dir = info.data['data_dir']
             return f"sqlite:///{data_dir}/calsync.db"
         return v
     
-    @validator('credentials_dir')
-    def set_default_credentials_dir(cls, v, values):
+    @field_validator('credentials_dir')
+    @classmethod
+    def set_default_credentials_dir(cls, v, info):
         """Set default credentials directory if not provided."""
-        if v is None and 'data_dir' in values:
-            return values['data_dir'] / "credentials"
+        if v is None and hasattr(info.data, 'get') and info.data.get('data_dir'):
+            return info.data['data_dir'] / "credentials"
         return v
     
-    @validator('log_level')
+    @field_validator('log_level')
+    @classmethod
     def validate_log_level(cls, v):
         """Validate log level."""
         valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
@@ -137,7 +141,8 @@ class Settings(BaseSettings):
             raise ValueError(f"Log level must be one of: {valid_levels}")
         return v.upper()
     
-    @validator('google_client_id')
+    @field_validator('google_client_id')
+    @classmethod
     def validate_google_client_id(cls, v):
         """Validate Google OAuth Client ID format."""
         if not v:
@@ -148,7 +153,8 @@ class Settings(BaseSettings):
             raise ValueError("Google Client ID must be at least 10 characters")
         return v
     
-    @validator('google_client_secret')
+    @field_validator('google_client_secret')
+    @classmethod
     def validate_google_client_secret(cls, v):
         """Validate Google Client Secret format."""
         if not v:
@@ -159,7 +165,8 @@ class Settings(BaseSettings):
             raise ValueError("Google Client Secret must be at least 10 characters")
         return v
     
-    @validator('icloud_username')
+    @field_validator('icloud_username')
+    @classmethod
     def validate_icloud_username(cls, v):
         """Validate iCloud username is a valid email."""
         if not v:
@@ -170,7 +177,8 @@ class Settings(BaseSettings):
             raise ValueError("iCloud username must be a valid email address")
         return v
     
-    @validator('icloud_password')
+    @field_validator('icloud_password')
+    @classmethod
     def validate_icloud_password(cls, v):
         """Validate iCloud app-specific password format."""
         if not v:

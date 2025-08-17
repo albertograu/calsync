@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, List, Set, TypeVar, Generic
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import pytz
 
 
@@ -59,19 +59,21 @@ class CalendarEvent(BaseModel):
     attendees: List[Dict[str, Any]] = Field(default_factory=list, description="Event attendees")
     original_data: Optional[Dict[str, Any]] = Field(None, description="Original event data")
     
-    @validator('start', 'end', 'created', 'updated', pre=True)
+    @field_validator('start', 'end', 'created', 'updated', mode='before')
+    @classmethod
     def ensure_timezone_aware(cls, v):
         """Ensure datetime objects are timezone-aware."""
         if isinstance(v, datetime) and v.tzinfo is None:
             return v.replace(tzinfo=pytz.UTC)
         return v
     
-    @validator('end')
-    def end_after_start(cls, v, values):
+    @field_validator('end')
+    @classmethod
+    def end_after_start(cls, v, info):
         """Ensure end time is after start time."""
-        if 'start' in values and v <= values['start']:
+        if hasattr(info.data, 'get') and info.data.get('start') and v <= info.data['start']:
             # More detailed error message for debugging
-            start_time = values['start']
+            start_time = info.data['start']
             raise ValueError(
                 f'End time ({v}) must be after start time ({start_time}). '
                 f'This usually indicates timezone conversion issues or corrupted event data.'
@@ -258,10 +260,11 @@ class CalendarPair(BaseModel):
     enabled: bool = Field(True, description="Whether this pair is enabled for sync")
     conflict_resolution: Optional[ConflictResolution] = Field(None, description="Override global conflict resolution for this pair")
     
-    @validator('sync_direction')
-    def validate_sync_direction(cls, v, values):
+    @field_validator('sync_direction')
+    @classmethod
+    def validate_sync_direction(cls, v, info):
         """Validate sync direction."""
-        if v is not None and not values.get('bidirectional', True):
+        if v is not None and not (hasattr(info.data, 'get') and info.data.get('bidirectional', True)):
             valid_directions = ['google_to_icloud', 'icloud_to_google']
             if v not in valid_directions:
                 raise ValueError(f'sync_direction must be one of {valid_directions}')
@@ -325,7 +328,8 @@ class SyncConfiguration(BaseModel):
     selected_google_calendars: List[str] = Field(default_factory=list, description="DEPRECATED: use calendar_pairs")
     selected_icloud_calendars: List[str] = Field(default_factory=list, description="DEPRECATED: use calendar_pairs")
     
-    @validator('calendar_pairs')
+    @field_validator('calendar_pairs')
+    @classmethod
     def validate_calendar_pairs(cls, v):
         """Validate that calendar pairs don't have duplicate calendar IDs."""
         google_ids = [pair.google_calendar_id for pair in v if pair.enabled]
