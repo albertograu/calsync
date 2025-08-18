@@ -147,13 +147,19 @@ class SyncEngine:
     
     async def initialize(self) -> None:
         """Initialize the sync engine."""
+        self.logger.info("🔧 INIT: Starting sync engine initialization...")
+        
         # Initialize database
+        self.logger.info("🔧 INIT: Initializing database...")
         self.db_manager.init_db()
+        self.logger.info("✅ INIT: Database initialized")
         
         # Authenticate services
+        self.logger.info("🔧 INIT: Authenticating services...")
         await self._authenticate_services()
+        self.logger.info("✅ INIT: Services authenticated")
         
-        self.logger.info("Sync engine initialized successfully")
+        self.logger.info("🎉 INIT: Sync engine initialized successfully")
     
     async def cleanup(self) -> None:
         """Clean up resources."""
@@ -181,14 +187,21 @@ class SyncEngine:
         Returns:
             Dictionary with connection test results
         """
-        if not self._services_authenticated:
-            await self._authenticate_services()
+        self.logger.info("🔧 TEST: Starting connection tests...")
         
+        if not self._services_authenticated:
+            self.logger.info("🔧 TEST: Authenticating services...")
+            await self._authenticate_services()
+            self.logger.info("✅ TEST: Service authentication complete")
+        
+        self.logger.info("🟢 TEST: Testing Google Calendar connection...")
+        self.logger.info("🍎 TEST: Testing iCloud Calendar connection...")
         google_result, icloud_result = await asyncio.gather(
             self.google_service.test_connection(),
             self.icloud_service.test_connection(),
             return_exceptions=True
         )
+        self.logger.info("✅ TEST: Connection tests complete")
         
         return {
             'google': google_result if not isinstance(google_result, Exception) else {
@@ -230,19 +243,22 @@ class SyncEngine:
             )
         
         try:
-            self.logger.info(f"Starting sync session {sync_session.id} (dry_run={dry_run})")
+            self.logger.info(f"🚀 SYNC START: Starting sync session {sync_session.id} (dry_run={dry_run})")
             
             # Get or create calendar mappings
+            self.logger.info("🔍 SYNC STEP 1: Getting calendar mappings...")
             calendar_mappings = await self._get_or_create_calendar_mappings()
+            self.logger.info(f"✅ SYNC STEP 1 COMPLETE: Found {len(calendar_mappings) if calendar_mappings else 0} calendar mappings")
             
             if not calendar_mappings:
                 self.logger.warning("No calendar mappings found or configured")
                 raise Exception("No calendar mappings available for synchronization")
             
-            self.logger.info(f"Syncing {len(calendar_mappings)} calendar pairs")
+            self.logger.info(f"🔍 SYNC STEP 2: Syncing {len(calendar_mappings)} calendar pairs")
             
             # Perform bidirectional sync for each mapped calendar pair
-            for mapping in calendar_mappings:
+            for i, mapping in enumerate(calendar_mappings, 1):
+                self.logger.info(f"📅 SYNC STEP 2.{i}: Starting calendar pair {mapping.google_calendar_name} <-> {mapping.icloud_calendar_name}")
                 await self._sync_calendar_pair(
                     mapping.google_calendar_id,
                     mapping.icloud_calendar_id, 
@@ -251,13 +267,16 @@ class SyncEngine:
                     sync_report, 
                     dry_run
                 )
+                self.logger.info(f"✅ SYNC STEP 2.{i} COMPLETE: Finished calendar pair {mapping.google_calendar_name} <-> {mapping.icloud_calendar_name}")
             
+            self.logger.info("🔍 SYNC STEP 3: Completing sync session...")
             # Complete sync session
             with self.db_manager.get_session() as session:
                 self.db_manager.complete_sync_session(session, sync_session, status='completed')
             
             sync_report.completed_at = datetime.now(pytz.UTC)
-            self.logger.info(f"Sync session {sync_session.id} completed successfully")
+            self.logger.info(f"✅ SYNC STEP 3 COMPLETE: Session marked as completed in database")
+            self.logger.info(f"🎉 SYNC SUCCESS: Session {sync_session.id} completed successfully")
             
         except Exception as e:
             # Mark sync session as failed
@@ -434,10 +453,12 @@ class SyncEngine:
         new_icloud_sync_token: Optional[str] = None
 
         # Fetch Google change set with proper error handling
+        self.logger.info("🟢 GOOGLE API: Starting Google change set fetch...")
         g_cs = await self._fetch_google_change_set_with_retry(
             google_calendar_id, google_sync_token, time_min, time_max, 
             last_sync_time, calendar_mapping
         )
+        self.logger.info(f"✅ GOOGLE API: Change set fetch complete - {len(g_cs.changed)} changed, {len(g_cs.deleted_native_ids)} deleted")
 
         google_events = dict(g_cs.changed)
         google_deleted_ids = set(g_cs.deleted_native_ids)
@@ -449,6 +470,7 @@ class SyncEngine:
         # Fetch iCloud change set
         # CRITICAL FIX: Don't use newly acquired sync token in the same run
         sync_token_to_use = None if icloud_token_acquired_this_run else icloud_sync_token
+        self.logger.info("🍎 ICLOUD API: Starting iCloud change set fetch...")
         
         i_cs: ChangeSet[CalendarEvent] = await self.icloud_service.get_change_set(
             icloud_calendar_id,
@@ -458,6 +480,7 @@ class SyncEngine:
             updated_min=None if sync_token_to_use else last_sync_time,
             sync_token=sync_token_to_use
         )
+        self.logger.info(f"✅ ICLOUD API: Change set fetch complete - {len(i_cs.changed)} changed, {len(i_cs.deleted_native_ids)} deleted")
         icloud_events = dict(i_cs.changed)
         icloud_deleted_raw = set(i_cs.deleted_native_ids)
         new_icloud_sync_token = i_cs.next_sync_token

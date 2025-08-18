@@ -119,35 +119,29 @@ async def sync(ctx, dry_run, conflict_resolution):
         console.print("[yellow]Running in dry-run mode - no changes will be made[/yellow]")
     
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-            transient=True
-        ) as progress:
-            # Initialize sync engine
-            task = progress.add_task("Initializing sync engine...", total=None)
+        # Initialize sync engine
+        console.print("🔧 Initializing sync engine...")
+        
+        async with SyncEngine(settings) as sync_engine:
+            console.print("🔧 Testing connections...")
             
-            async with SyncEngine(settings) as sync_engine:
-                progress.update(task, description="Testing connections...")
-                
-                # Test connections
-                connection_results = await sync_engine.test_connections()
-                
-                if not connection_results['google']['success']:
-                    console.print(f"[red]Google Calendar connection failed: {connection_results['google']['error']}[/red]")
-                    sys.exit(1)
-                
-                if not connection_results['icloud']['success']:
-                    console.print(f"[red]iCloud Calendar connection failed: {connection_results['icloud']['error']}[/red]")
-                    sys.exit(1)
-                
-                progress.update(task, description="Synchronizing calendars...")
-                
-                # Perform sync
-                sync_report = await sync_engine.sync_calendars(dry_run=dry_run)
-                
-                progress.update(task, description="Sync completed")
+            # Test connections
+            connection_results = await sync_engine.test_connections()
+            
+            if not connection_results['google']['success']:
+                console.print(f"[red]Google Calendar connection failed: {connection_results['google']['error']}[/red]")
+                sys.exit(1)
+            
+            if not connection_results['icloud']['success']:
+                console.print(f"[red]iCloud Calendar connection failed: {connection_results['icloud']['error']}[/red]")
+                sys.exit(1)
+            
+            console.print("🚀 Synchronizing calendars...")
+            
+            # Perform sync
+            sync_report = await sync_engine.sync_calendars(dry_run=dry_run)
+            
+            console.print("✅ Sync completed")
         
         # Display results
         _display_sync_results(sync_report)
