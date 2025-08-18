@@ -404,16 +404,21 @@ class SyncEngine:
         else:
             self.logger.info(f"🔄 Using existing Google sync token: {google_sync_token[:50]}...")
         
+        # CRITICAL FIX: Track whether sync token was acquired during THIS sync run
+        icloud_token_acquired_this_run = False
+        icloud_sync_token_for_next_run = None
+        
         if not icloud_sync_token:
             self.logger.info(f"🚀 ACQUIRING ICLOUD SYNC TOKEN for calendar {icloud_calendar_id}")
             try:
-                icloud_sync_token = await self.icloud_service.get_sync_token(icloud_calendar_id)
-                self.logger.info(f"✅ iCloud sync token acquired successfully: {icloud_sync_token[:50] if len(str(icloud_sync_token)) > 50 else icloud_sync_token}")
-                self.logger.info("🎯 iCloud incremental sync now ENABLED")
+                icloud_sync_token_for_next_run = await self.icloud_service.get_sync_token(icloud_calendar_id)
+                self.logger.info(f"✅ iCloud sync token acquired successfully: {icloud_sync_token_for_next_run[:50] if len(str(icloud_sync_token_for_next_run)) > 50 else icloud_sync_token_for_next_run}")
+                self.logger.info("🎯 iCloud sync token saved for NEXT sync run (using time-window for THIS run)")
+                icloud_token_acquired_this_run = True
             except Exception as e:
                 self.logger.error(f"❌ Failed to acquire iCloud sync token: {type(e).__name__}: {e}")
                 self.logger.warning("⚠️  Falling back to time-window sync for iCloud (no deletion detection)")
-                icloud_sync_token = None
+                icloud_sync_token_for_next_run = None
         else:
             self.logger.info(f"🔄 Using existing iCloud sync token: {icloud_sync_token[:50] if len(str(icloud_sync_token)) > 50 else icloud_sync_token}...")
         
@@ -442,13 +447,16 @@ class SyncEngine:
                 google_events_by_uid[ev.uid] = ev
 
         # Fetch iCloud change set
+        # CRITICAL FIX: Don't use newly acquired sync token in the same run
+        sync_token_to_use = None if icloud_token_acquired_this_run else icloud_sync_token
+        
         i_cs: ChangeSet[CalendarEvent] = await self.icloud_service.get_change_set(
             icloud_calendar_id,
-            time_min=None if icloud_sync_token else time_min,
-            time_max=None if icloud_sync_token else time_max,
+            time_min=None if sync_token_to_use else time_min,
+            time_max=None if sync_token_to_use else time_max,
             max_results=self.settings.sync_config.max_events_per_sync,
-            updated_min=None if icloud_sync_token else last_sync_time,
-            sync_token=icloud_sync_token
+            updated_min=None if sync_token_to_use else last_sync_time,
+            sync_token=sync_token_to_use
         )
         icloud_events = dict(i_cs.changed)
         icloud_deleted_raw = set(i_cs.deleted_native_ids)
@@ -511,8 +519,16 @@ class SyncEngine:
                         self.logger.info(f"💾 Database: Updated iCloud sync token (from API response)")
                         self.logger.info(f"  📊 Old: {old_token if old_token else 'None'}")
                         self.logger.info(f"  📊 New: {new_icloud_sync_token}")
+                    elif icloud_sync_token_for_next_run:
+                        # CRITICAL FIX: Save token acquired during this run for next sync
+                        old_token = mapping.icloud_sync_token
+                        mapping.icloud_sync_token = icloud_sync_token_for_next_run
+                        mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                        self.logger.info(f"💾 Database: Saved newly acquired iCloud sync token for next run")
+                        self.logger.info(f"  📊 Old: {old_token if old_token else 'None'}")
+                        self.logger.info(f"  📊 New: {icloud_sync_token_for_next_run}")
                     elif icloud_sync_token != calendar_mapping.icloud_sync_token:
-                        # Initially acquired token
+                        # Initially acquired token (fallback case)
                         old_token = mapping.icloud_sync_token
                         mapping.icloud_sync_token = icloud_sync_token
                         mapping.icloud_last_updated = datetime.now(pytz.UTC)
