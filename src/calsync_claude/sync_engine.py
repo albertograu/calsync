@@ -231,16 +231,21 @@ class SyncEngine:
             Sync report with detailed results
         """
         if not self._services_authenticated:
+            self.logger.info("🔧 AUTH: Authenticating services...")
             await self._authenticate_services()
+            self.logger.info("✅ AUTH: Services authenticated")
         
         # Create sync session
+        self.logger.info("🔧 SESSION: Creating sync session...")
         with self.db_manager.get_session() as session:
             sync_session = self.db_manager.create_sync_session(session, dry_run=dry_run)
+            self.logger.info(f"✅ SESSION: Sync session created with ID {sync_session.id}")
             sync_report = SyncReport(
                 sync_id=sync_session.id,
                 started_at=sync_session.started_at,
                 dry_run=dry_run
             )
+            self.logger.info("✅ SESSION: SyncReport created")
         
         try:
             self.logger.info(f"🚀 SYNC START: Starting sync session {sync_session.id} (dry_run={dry_run})")
@@ -364,8 +369,9 @@ class SyncEngine:
             sync_report: Sync report to update
             dry_run: Whether this is a dry run
         """
+        self.logger.info("🚀 PAIR SYNC START: _sync_calendar_pair method called")
         self.logger.info(
-            f"Syncing calendar pair: {calendar_mapping.google_calendar_name or google_calendar_id} "
+            f"🚀 PAIR SYNC: Syncing calendar pair: {calendar_mapping.google_calendar_name or google_calendar_id} "
             f"<-> {calendar_mapping.icloud_calendar_name or icloud_calendar_id}"
         )
         
