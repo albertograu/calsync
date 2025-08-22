@@ -108,14 +108,20 @@ class CalendarEvent(BaseModel):
         return self.uid if self.uid else self.content_hash()
     
     def should_sync_to_calendar(self, target_calendar_id: str, existing_events: Dict[str, 'CalendarEvent']) -> bool:
-        """Check if this event should be synced to target calendar."""
-        dedup_key = self.get_dedup_key()
+        """Check if this event should be synced to target calendar.
         
-        # Check if an event with same UID already exists in target
-        for existing_event in existing_events.values():
-            if existing_event.get_dedup_key() == dedup_key:
-                return False  # Don't sync, duplicate exists
+        CRITICAL FIX: This method was blocking iCloud→Google sync because it was
+        preventing sync when events with same UID exist in target. For bidirectional
+        sync, we need to allow sync and let the mapping logic handle duplicates.
         
+        The sync engine will check for existing mappings and decide whether to
+        create, update, or skip based on the actual mapping state and content changes.
+        """
+        # FIXED: Always return True to allow sync engine to make proper decisions
+        # The sync engine has proper logic to:
+        # 1. Check existing event mappings in database
+        # 2. Compare content hashes to detect changes
+        # 3. Handle create vs update vs skip appropriately
         return True
     
     def is_recurrence_master(self) -> bool:

@@ -584,6 +584,14 @@ class SyncEngine:
             f"iCloud changed={len(icloud_events)} deleted_raw={len(icloud_deleted_raw)}"
         )
         
+        # DEBUG: Log iCloud event details
+        if icloud_events:
+            self.logger.info(f"🍎 DEBUG: iCloud events found:")
+            for event_id, event in icloud_events.items():
+                self.logger.info(f"  Event ID: {event_id}, Summary: '{event.summary}', UID: {event.uid}")
+        else:
+            self.logger.info(f"🍎 DEBUG: No iCloud events in change set")
+        
         # Get existing event mappings for this calendar pair
         with self.db_manager.get_session() as session:
             existing_mappings = session.query(EventMappingDB).filter(
@@ -657,6 +665,7 @@ class SyncEngine:
         
         if calendar_mapping.bidirectional or calendar_mapping.sync_direction == 'icloud_to_google':
             # Process iCloud -> Google sync with recurrence grouping
+            self.logger.info(f"🍎→📧 ICLOUD→GOOGLE SYNC: Processing {len(icloud_events_grouped)} event groups")
             for group_id, group_data in icloud_events_grouped.items():
                 if group_id in processed_icloud:
                     continue
@@ -665,7 +674,10 @@ class SyncEngine:
                 override_events = group_data['overrides']
                 
                 # Sync master event first
-                if master_event.should_sync_to_calendar(google_calendar_id, google_events):
+                self.logger.info(f"🔍 DEBUG: Checking if iCloud event '{master_event.summary}' should sync to Google")
+                should_sync = master_event.should_sync_to_calendar(google_calendar_id, google_events)
+                self.logger.info(f"🔍 DEBUG: should_sync_to_calendar returned: {should_sync}")
+                if should_sync:
                     await self._sync_event_to_target(
                         master_event, EventSource.GOOGLE, google_calendar_id,
                         calendar_mapping, mappings_by_icloud, sync_session, sync_report, dry_run,
