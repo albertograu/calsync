@@ -1,0 +1,19 @@
+{$DOMAIN} {
+    encode gzip
+    tls {$EMAIL}
+
+    @google path /webhooks/google
+    handle @google {
+        reverse_proxy calsync:8080
+    }
+
+    @health path /health
+    handle @health {
+        reverse_proxy calsync:8080
+    }
+
+    route {
+        respond "OK" 200
+    }
+}
+

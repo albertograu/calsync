@@ -14,6 +14,9 @@ if [ "$1" = "daemon" ]; then
 elif [ "$1" = "sync" ]; then
   shift
   exec calsync-claude sync "$@"
+elif [ "$1" = "serve" ]; then
+  shift
+  exec calsync-claude serve --host 0.0.0.0 --port "${PORT:-8080}"
 else
   exec "$@"
 fi

@@ -1,0 +1,49 @@
+version: "3.9"
+
+services:
+  calsync:
+    build: .
+    container_name: calsync-claude
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PORT=${PORT:-8080}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+      - SYNC_CONFIG__SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-30}
+      - SYNC_CONFIG__MAX_EVENTS_PER_SYNC=${MAX_EVENTS_PER_SYNC:-1000}
+      - SYNC_CONFIG__SYNC_PAST_DAYS=${SYNC_PAST_DAYS:-30}
+      - SYNC_CONFIG__SYNC_FUTURE_DAYS=${SYNC_FUTURE_DAYS:-365}
+      - ICLOUD_POLL_SECONDS=${ICLOUD_POLL_SECONDS:-30}
+      - ENABLE_GOOGLE_PUSH=${ENABLE_GOOGLE_PUSH:-true}
+      - GOOGLE_CHANNEL_TOKEN=${GOOGLE_CHANNEL_TOKEN:-changeme}
+      - GOOGLE_CHANNEL_RENEW_INTERVAL_MINS=${GOOGLE_CHANNEL_RENEW_INTERVAL_MINS:-60}
+      - GOOGLE_CHANNEL_RENEW_BEFORE_MINS=${GOOGLE_CHANNEL_RENEW_BEFORE_MINS:-1440}
+    volumes:
+      - ./data:/data
+      - ./credentials:/credentials
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    command: ["serve"]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: calsync-proxy
+    restart: unless-stopped
+    environment:
+      - DOMAIN=${DOMAIN}
+      - EMAIL=${EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - calsync
+
+volumes:
+  caddy_data:
+  caddy_config:

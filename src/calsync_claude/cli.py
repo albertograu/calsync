@@ -20,6 +20,7 @@ from .config import Settings, load_settings, create_example_config, migrate_lega
 from .sync_engine import SyncEngine
 from .models import ConflictResolution, CalendarPair
 from .database import DatabaseManager
+from uuid import uuid4
 
 console = Console()
 logger = structlog.get_logger()
@@ -87,6 +88,18 @@ def cli(ctx, config, debug, verbose):
         console.print(f"[red]Error loading configuration: {e}[/red]")
         sys.exit(1)
 
+
+@cli.command()
+@click.option('--host', default='0.0.0.0', help='Bind host for HTTP server')
+@click.option('--port', default=8080, type=int, help='Bind port for HTTP server')
+def serve(host, port):
+    """Run HTTP server with background sync daemon (container friendly)."""
+    try:
+        import uvicorn
+        uvicorn.run("calsync_claude.server:app", host=host, port=port, reload=False)
+    except Exception as e:
+        console.print(f"[red]Failed to start server: {e}[/red]")
+        sys.exit(1)
 
 @cli.command()
 @click.option('--dry-run', '-n', is_flag=True, 
@@ -447,6 +460,245 @@ async def list_calendars(ctx):
         
     except Exception as e:
         console.print(f"[red]Failed to list calendars: {e}[/red]")
+
+
+@cli.group()
+def google():
+    """Google-specific utilities."""
+    pass
+
+
+@google.command('watch')
+@click.option('--calendar', '-c', required=True, help='Google calendar ID (or name from calendars list)')
+@click.option('--address', '-a', required=True, help='Public HTTPS webhook URL for push notifications')
+@click.option('--token', '-t', required=True, help='Shared secret to validate webhook (X-Goog-Channel-Token)')
+@async_command
+async def google_watch(ctx, calendar, address, token):
+    """Register a Google push notification channel for a calendar."""
+    settings = ctx.obj['settings']
+    try:
+        async with SyncEngine(settings) as engine:
+            # Resolve calendar ID if a friendly name was provided
+            cal_id = calendar
+            calendars = await engine.google_service.get_calendars()
+            for cal in calendars:
+                if cal.id == calendar or (cal.name and cal.name.lower() == calendar.lower()):
+                    cal_id = cal.id
+                    break
+            # Channel
+            channel_id = str(uuid4())
+            body = {
+                'id': channel_id,
+                'type': 'web_hook',
+                'address': address,
+                'token': token,
+            }
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: engine.google_service.service.events().watch(calendarId=cal_id, body=body).execute()
+            )
+            # Persist minimal info
+            out = {
+                'calendarId': cal_id,
+                'channelId': result.get('id', channel_id),
+                'resourceId': result.get('resourceId'),
+                'expiration': result.get('expiration'),
+                'address': address,
+            }
+            path = Path(settings.data_dir) / 'google_channels.json'
+            existing = []
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text())
+                except Exception:
+                    existing = []
+            existing = [e for e in existing if e.get('calendarId') != cal_id]
+            existing.append(out)
+            path.write_text(json.dumps(existing, indent=2))
+            console.print(f"[green]✓ Watch registered[/green] → {path}")
+            console.print(json.dumps(out, indent=2))
+    except Exception as e:
+        console.print(f"[red]Failed to register watch: {e}[/red]")
+        if settings.debug:
+            console.print_exception()
+        sys.exit(1)
+
+
+@google.command('renew')
+@click.option('--renew-before-mins', default=1440, type=int, help='Renew channels expiring within this many minutes')
+@click.option('--force', is_flag=True, help='Force renew all stored channels regardless of expiration')
+@click.option('--token', '-t', help='Shared secret to validate webhook (defaults to GOOGLE_CHANNEL_TOKEN env)')
+@async_command
+async def google_renew(ctx, renew_before_mins, force, token):
+    """Renew existing Google push channels stored in /data/google_channels.json."""
+    from datetime import datetime, timezone, timedelta
+    settings = ctx.obj['settings']
+    path = Path(settings.data_dir) / 'google_channels.json'
+    if not path.exists():
+        console.print("[yellow]No stored channels found (google_channels.json)\nRun 'google watch' first.[/yellow]")
+        return
+    try:
+        items = json.loads(path.read_text()) or []
+    except Exception as e:
+        console.print(f"[red]Failed to read channels file: {e}[/red]")
+        return
+
+    exp_threshold = datetime.now(timezone.utc) + timedelta(minutes=renew_before_mins)
+    updated = []
+    secret = token or os.getenv('GOOGLE_CHANNEL_TOKEN')
+    if not secret:
+        console.print("[yellow]No token provided; set GOOGLE_CHANNEL_TOKEN or pass --token[/yellow]")
+
+    async with SyncEngine(settings) as engine:
+        for ch in items:
+            cal_id = ch.get('calendarId')
+            address = ch.get('address')
+            channel_id = ch.get('channelId') or ch.get('id')
+            resource_id = ch.get('resourceId')
+            expiration = ch.get('expiration')
+
+            exp_dt = None
+            if isinstance(expiration, str) and expiration.isdigit():
+                try:
+                    exp_dt = datetime.fromtimestamp(int(expiration)/1000, tz=timezone.utc)
+                except Exception:
+                    exp_dt = None
+            elif isinstance(expiration, str):
+                try:
+                    exp_dt = datetime.fromisoformat(expiration)
+                except Exception:
+                    exp_dt = None
+
+            needs_renew = force or (not exp_dt) or (exp_dt <= exp_threshold)
+            if not needs_renew:
+                updated.append(ch)
+                continue
+
+            # Stop old channel if we have both ids
+            if channel_id and resource_id:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: engine.google_service.service.channels().stop(
+                            body={'id': channel_id, 'resourceId': resource_id}
+                        ).execute()
+                    )
+                    console.print(f"[green]✓ Stopped channel[/green] {channel_id} for {cal_id}")
+                except Exception as e:
+                    console.print(f"[yellow]Could not stop channel {channel_id}: {e}[/yellow]")
+
+            # Create new watch
+            try:
+                new_channel_id = str(uuid4())
+                body = {'id': new_channel_id, 'type': 'web_hook', 'address': address}
+                if secret:
+                    body['token'] = secret
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: engine.google_service.service.events().watch(calendarId=cal_id, body=body).execute()
+                )
+                ch_new = {
+                    'calendarId': cal_id,
+                    'channelId': result.get('id', new_channel_id),
+                    'resourceId': result.get('resourceId'),
+                    'expiration': result.get('expiration'),
+                    'address': address,
+                }
+                updated.append(ch_new)
+                console.print(f"[green]✓ Renewed watch[/green] for {cal_id}")
+            except Exception as e:
+                console.print(f"[red]Failed to renew watch for {cal_id}: {e}[/red]")
+                updated.append(ch)  # keep old entry
+
+    try:
+        path.write_text(json.dumps(updated, indent=2))
+        console.print(f"[green]✓ Updated[/green] {path}")
+    except Exception as e:
+        console.print(f"[red]Failed to update channels file: {e}[/red]")
+
+
+@google.command('unwatch')
+@click.option('--calendar', '-c', help='Google calendar ID or name to unwatch; if omitted, unwatch all')
+@async_command
+async def google_unwatch(ctx, calendar):
+    """Stop existing channels (optionally filtered by calendar) and remove from storage."""
+    settings = ctx.obj['settings']
+    path = Path(settings.data_dir) / 'google_channels.json'
+    if not path.exists():
+        console.print("[yellow]No stored channels found (google_channels.json)[/yellow]")
+        return
+    try:
+        items = json.loads(path.read_text()) or []
+    except Exception as e:
+        console.print(f"[red]Failed to read channels file: {e}[/red]")
+        return
+
+    async with SyncEngine(settings) as engine:
+        remaining = []
+        for ch in items:
+            cal_id = ch.get('calendarId')
+            if calendar and (cal_id != calendar):
+                # Allow name matching
+                match = False
+                try:
+                    cals = await engine.google_service.get_calendars()
+                    for cal in cals:
+                        if cal.id == cal_id and cal.name and cal.name.lower() == calendar.lower():
+                            match = True
+                            break
+                except Exception:
+                    match = False
+                if not match:
+                    remaining.append(ch)
+                    continue
+
+            channel_id = ch.get('channelId') or ch.get('id')
+            resource_id = ch.get('resourceId')
+            if channel_id and resource_id:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: engine.google_service.service.channels().stop(
+                            body={'id': channel_id, 'resourceId': resource_id}
+                        ).execute()
+                    )
+                    console.print(f"[green]✓ Unwatched[/green] {cal_id}")
+                except Exception as e:
+                    console.print(f"[yellow]Failed to unwatch {cal_id}: {e}[/yellow]")
+            # Do not keep this entry
+
+    try:
+        if calendar:
+            # Write only remaining if filtered
+            path.write_text(json.dumps(remaining, indent=2))
+        else:
+            # Remove file when all unwatched
+            path.unlink(missing_ok=True)
+        console.print("[green]✓ Channels storage updated[/green]")
+    except Exception as e:
+        console.print(f"[yellow]Warning: could not update channels storage: {e}[/yellow]")
+
+
+@cli.group()
+def ids():
+    """Global ID management commands."""
+    pass
+
+
+@ids.command('backfill')
+@async_command
+async def ids_backfill(ctx):
+    """Backfill CalSync IDs and mappings by running a full sync once."""
+    settings = ctx.obj['settings']
+    try:
+        async with SyncEngine(settings) as engine:
+            await engine.sync_calendars(dry_run=False)
+        console.print("[green]✓ Backfill complete[/green]")
+    except Exception as e:
+        console.print(f"[red]Backfill failed: {e}[/red]")
+        if settings.debug:
+            console.print_exception()
+        sys.exit(1)
         sys.exit(1)
 
 

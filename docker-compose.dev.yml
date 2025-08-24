@@ -20,7 +20,13 @@ services:
       - ./credentials:/credentials
       # Optional: Mount source code for live development (uncomment if needed)
       # - ./src:/app/src:ro  # Read-only source mount for debugging
-    command: ['daemon']
+    command: ['serve']
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - ENABLE_GOOGLE_PUSH=${ENABLE_GOOGLE_PUSH:-false}
+      - GOOGLE_CHANNEL_TOKEN=${GOOGLE_CHANNEL_TOKEN:-changeme}
 
   # Alternative service for one-off sync testing
   calsync-test:
