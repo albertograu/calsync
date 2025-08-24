@@ -39,6 +39,10 @@ class CalendarEvent(BaseModel):
     """Standardized calendar event model."""
     
     id: str = Field(..., description="Event ID from source service")
+    calsync_id: Optional[str] = Field(
+        None,
+        description="Global CalSync identifier embedded into both services (X-CALSYNC-ID / extendedProperties)"
+    )
     uid: Optional[str] = Field(None, description="Universal event UID (iCal UID for deduplication)")
     source: EventSource = Field(..., description="Source service")
     summary: str = Field("", description="Event title/summary")

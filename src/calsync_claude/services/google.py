@@ -493,6 +493,12 @@ class GoogleCalendarService(BaseCalendarService):
                 'start': {'date': event_data.start.strftime('%Y-%m-%d')} if event_data.all_day else {'dateTime': event_data.start.isoformat()},
                 'end': {'date': event_data.end.strftime('%Y-%m-%d')} if event_data.all_day else {'dateTime': event_data.end.isoformat()}
             }
+
+            # Embed CalSync global identifier into private extendedProperties for strict mapping
+            if getattr(event_data, 'calsync_id', None):
+                google_event_data['extendedProperties'] = {
+                    'private': {'calsync.id': event_data.calsync_id}
+                }
             
             # Add iCalUID for cross-platform matching (this was working fine)
             if event_data.uid:
@@ -1050,8 +1056,20 @@ class GoogleCalendarService(BaseCalendarService):
         # Generate or use UID - Google events use iCalUID for deduplication
         uid = event_data.get('iCalUID', f"google-{event_data['id']}")
         
+        # Extract CalSync global identifier from private extended properties
+        calsync_id = None
+        try:
+            calsync_id = (
+                event_data.get('extendedProperties', {})
+                .get('private', {})
+                .get('calsync.id')
+            )
+        except Exception:
+            calsync_id = None
+        
         return CalendarEvent(
             id=event_data['id'],
+            calsync_id=calsync_id,
             uid=uid,
             source=EventSource.GOOGLE,
             summary=event_data.get('summary', ''),
@@ -1091,6 +1109,20 @@ class GoogleCalendarService(BaseCalendarService):
             'description': sanitize_text(event.description, 8192),  # Google Calendar limit
             'location': sanitize_text(event.location, 1024)  # Google Calendar limit
         }
+
+        # Embed CalSync global ID in private extended properties for strict mapping
+        if getattr(event, 'calsync_id', None):
+            google_event['extendedProperties'] = {
+                'private': {'calsync.id': event.calsync_id}
+            }
+        
+        # Embed CalSync global identifier in private extended properties
+        if getattr(event, 'calsync_id', None):
+            google_event['extendedProperties'] = {
+                'private': {
+                    'calsync.id': event.calsync_id
+                }
+            }
         
         # CRITICAL FIX: Always generate compliant event IDs for iCloud events
         # iCloud uses UUID format (with hyphens) which is invalid for Google Calendar

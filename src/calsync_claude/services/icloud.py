@@ -993,8 +993,18 @@ class iCloudCalendarService(BaseCalendarService):
                 )
                 return None
             
+            # Extract CalSync global identifier from custom property if present
+            calsync_id = None
+            try:
+                calsync_id = vevent.get('X-CALSYNC-ID') or vevent.get('x-calsync-id')
+                if calsync_id is not None:
+                    calsync_id = str(calsync_id)
+            except Exception:
+                calsync_id = None
+
             return CalendarEvent(
                 id=uid,
+                calsync_id=calsync_id,
                 uid=uid,
                 source=EventSource.ICLOUD,
                 summary=summary,
@@ -1055,6 +1065,13 @@ class iCloudCalendarService(BaseCalendarService):
         # Use UID from event or generate one
         uid = event_data.uid or event_data.id or f"calsync-claude-{hash(str(event_data))}"
         event.add('uid', uid)
+
+        # Embed CalSync global identifier for strict mapping between services
+        if getattr(event_data, 'calsync_id', None):
+            try:
+                event.add('X-CALSYNC-ID', str(event_data.calsync_id))
+            except Exception:
+                pass
         
         # Add basic properties
         event.add('summary', event_data.summary)

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
+from uuid import uuid4
 from typing import Dict, List, Optional, Tuple, Any, AsyncIterator, Set
 from contextlib import asynccontextmanager
 
@@ -847,6 +848,76 @@ class SyncEngine:
             
             mapping = mappings.get(source_event.id)
             content_hash = source_event.content_hash()
+
+            # STRICT ID MAPPING: Ensure every event has a stable CalSync global ID
+            # Assign and persist it back to the source if missing
+            if not getattr(source_event, 'calsync_id', None):
+                source_event.calsync_id = str(uuid4())
+                self.logger.info(
+                    f"Assigned CalSync ID {source_event.calsync_id} to source event {source_event.id} ({source_event.summary})"
+                )
+                if not dry_run:
+                    try:
+                        if source_event.source == EventSource.GOOGLE:
+                            await self.google_service.update_event(
+                                calendar_mapping.google_calendar_id,
+                                source_event.id,
+                                source_event
+                            )
+                        else:
+                            await self.icloud_service.update_event(
+                                calendar_mapping.icloud_calendar_id,
+                                source_event.id,
+                                source_event
+                            )
+                        self.logger.info("Persisted CalSync ID back to source event")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to persist CalSync ID to source event: {e}")
+
+            # Look up mapping by global CalSync ID first (authoritative)
+            try:
+                with self.db_manager.get_session() as session:
+                    mapping_by_uid = session.query(EventMappingDB).filter(
+                        EventMappingDB.calendar_mapping_id == calendar_mapping.id,
+                        EventMappingDB.event_uid == source_event.calsync_id
+                    ).first()
+                    if mapping_by_uid:
+                        mapping = mapping_by_uid
+                        # Backfill event_uid if missing
+                        if not getattr(mapping, 'event_uid', None):
+                            mapping.event_uid = source_event.calsync_id
+                            mapping.last_sync_at = datetime.now(pytz.UTC)
+                            session.merge(mapping)
+                            session.commit()
+                    elif mapping is not None and not getattr(mapping, 'event_uid', None):
+                        # Existing mapping found by native ID; attach CalSync ID to it
+                        mapping.event_uid = source_event.calsync_id
+                        mapping.last_sync_at = datetime.now(pytz.UTC)
+                        session.merge(mapping)
+                        session.commit()
+                    elif mapping is None:
+                        # Create new mapping seeded with global ID
+                        new_map = EventMappingDB(
+                            calendar_mapping_id=calendar_mapping.id,
+                            google_calendar_id=calendar_mapping.google_calendar_id,
+                            icloud_calendar_id=calendar_mapping.icloud_calendar_id,
+                            event_uid=source_event.calsync_id,
+                            content_hash=content_hash,
+                            sync_direction=f"{source_event.source.value}_to_{target_source.value}",
+                            last_sync_at=datetime.now(pytz.UTC)
+                        )
+                        if source_event.source == EventSource.GOOGLE:
+                            new_map.google_event_id = source_event.id
+                        else:
+                            new_map.icloud_event_id = source_event.id
+                        session.add(new_map)
+                        session.commit()
+                        mapping = new_map
+                        self.logger.info(
+                            f"Created new mapping for CalSync ID {source_event.calsync_id}"
+                        )
+            except Exception as e:
+                self.logger.warning(f"Strict ID mapping initialization failed: {e}")
             
             # Check if event moved from another calendar
             # This can happen in two cases:
