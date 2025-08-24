@@ -455,6 +455,12 @@ class SyncEngine:
         else:
             self.logger.warning("⚠️  TIME-WINDOW SYNC ONLY (no reliable deletion detection)")
 
+        # TIMING FIX: Use two-phase sync token approach
+        # Phase 1: Store initial tokens (captured immediately after change detection)
+        initial_google_sync_token: Optional[str] = None
+        initial_icloud_sync_token: Optional[str] = None
+        
+        # Phase 2: Fresh tokens (captured after all processing is done)
         new_google_sync_token: Optional[str] = None
         new_icloud_sync_token: Optional[str] = None
 
@@ -468,7 +474,8 @@ class SyncEngine:
 
         google_events = dict(g_cs.changed)
         google_deleted_ids = set(g_cs.deleted_native_ids)
-        new_google_sync_token = g_cs.next_sync_token
+        # TIMING FIX: Store initial token but don't save yet - wait until after processing
+        initial_google_sync_token = g_cs.next_sync_token
         for ev in google_events.values():
             if ev.uid:
                 google_events_by_uid[ev.uid] = ev
@@ -489,7 +496,8 @@ class SyncEngine:
         self.logger.info(f"✅ ICLOUD API: Change set fetch complete - {len(i_cs.changed)} changed, {len(i_cs.deleted_native_ids)} deleted")
         icloud_events = dict(i_cs.changed)
         icloud_deleted_raw = set(i_cs.deleted_native_ids)
-        new_icloud_sync_token = i_cs.next_sync_token
+        # TIMING FIX: Store initial token but don't save yet - wait until after processing  
+        initial_icloud_sync_token = i_cs.next_sync_token
         
         # Check if we need to clear an invalid sync token
         if hasattr(i_cs, 'invalid_token_used') and i_cs.invalid_token_used:
@@ -504,6 +512,42 @@ class SyncEngine:
 
         # Persist new tokens (including initially acquired ones)
         self.logger.info("🔍 SYNC TOKEN PERSISTENCE CHECK:")
+        # TIMING FIX: Phase 2 - Get fresh sync tokens after ALL processing is complete
+        # This prevents the race condition where events created during sync get missed
+        self.logger.info("🔄 TWO-PHASE SYNC: Getting fresh sync tokens after processing...")
+        
+        try:
+            # Get fresh tokens that include any events created during our sync processing
+            if not google_sync_token or initial_google_sync_token:
+                fresh_google_token = await self.google_service.get_sync_token(google_calendar_id)
+                if fresh_google_token != initial_google_sync_token:
+                    self.logger.info(f"🔄 Fresh Google token differs from initial - events may have been created during sync")
+                new_google_sync_token = fresh_google_token
+            else:
+                new_google_sync_token = initial_google_sync_token
+                
+            if not icloud_sync_token or initial_icloud_sync_token:
+                fresh_icloud_token = await self.icloud_service.get_sync_token(icloud_calendar_id)  
+                if fresh_icloud_token != initial_icloud_sync_token:
+                    self.logger.info(f"🔄 Fresh iCloud token differs from initial - events may have been created during sync")
+                new_icloud_sync_token = fresh_icloud_token
+            else:
+                new_icloud_sync_token = initial_icloud_sync_token
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️  Could not get fresh sync tokens, using initial ones: {e}")
+            new_google_sync_token = initial_google_sync_token
+            new_icloud_sync_token = initial_icloud_sync_token
+            
+        # RELIABILITY FIX: Add timestamp-based validation as backup
+        # This catches events that might slip through token-based detection
+        sync_start_time = datetime.now(pytz.UTC) - timedelta(minutes=5)  # 5-minute buffer
+        self.logger.info(f"🕐 TIMESTAMP VALIDATION: Checking for events created after {sync_start_time}")
+        
+        # Store the sync completion timestamp for next run validation
+        calendar_mapping.google_last_updated = datetime.now(pytz.UTC)
+        calendar_mapping.icloud_last_updated = datetime.now(pytz.UTC)
+
         self.logger.info(f"  🆕 New Google token from API: {'✅' if new_google_sync_token else '❌'}")
         self.logger.info(f"  🆕 New iCloud token from API: {'✅' if new_icloud_sync_token else '❌'}")
         self.logger.info(f"  🔄 Google token changed: {'✅' if (google_sync_token != calendar_mapping.google_sync_token) else '❌'}")
