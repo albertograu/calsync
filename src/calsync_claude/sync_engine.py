@@ -778,6 +778,15 @@ class SyncEngine:
             google_calendar_id, icloud_calendar_id, calendar_mapping,
             sync_session, sync_report, dry_run
         )
+        
+        # CRITICAL FIX: Post-processing race condition detection and recovery
+        # This happens AFTER all sync operations are complete to catch any events
+        # created during the sync processing that might be missed by next incremental sync
+        await self._post_sync_race_condition_check(
+            google_calendar_id, icloud_calendar_id, calendar_mapping,
+            initial_google_sync_token, initial_icloud_sync_token,
+            now, dry_run
+        )
     
     async def _sync_event_to_target(
         self,
@@ -2016,7 +2025,7 @@ class SyncEngine:
                 self.logger.debug(f"HREF patterns: {list(patterns)[:3]}")
     
     def _ensure_timezone_aware(self, dt: datetime) -> datetime:
-        """Ensure datetime is timezone-aware for safe comparison.
+        """Ensure timezone is timezone-aware for safe comparison.
         
         Args:
             dt: Datetime object that may be timezone-naive or timezone-aware
@@ -2033,3 +2042,485 @@ class SyncEngine:
         else:
             # Already timezone-aware
             return dt
+    
+    async def _post_sync_race_condition_check(
+        self,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        calendar_mapping: CalendarMappingDB,
+        initial_google_token: Optional[str],
+        initial_icloud_token: Optional[str],
+        sync_start_time: datetime,
+        dry_run: bool
+    ) -> None:
+        """Detect and recover from race conditions after sync processing completes.
+        
+        This method implements true post-processing token refresh by capturing
+        fresh sync tokens AFTER all sync operations are complete, then comparing
+        with initial tokens to detect if events were created during sync.
+        
+        Args:
+            google_calendar_id: Google calendar ID
+            icloud_calendar_id: iCloud calendar ID  
+            calendar_mapping: Calendar mapping from database
+            initial_google_token: Google sync token before processing
+            initial_icloud_token: iCloud sync token before processing
+            sync_start_time: When sync processing began
+            dry_run: Whether this is a dry run
+        """
+        self.logger.info("🔍 POST-SYNC RACE CONDITION CHECK: Starting post-processing validation...")
+        
+        try:
+            # PHASE 3: Get truly fresh tokens AFTER all processing is complete
+            post_sync_time = datetime.now(pytz.UTC)
+            processing_duration = (post_sync_time - sync_start_time).total_seconds()
+            
+            self.logger.info(f"⏱️  Sync processing took {processing_duration:.2f} seconds")
+            
+            # Get current fresh tokens
+            fresh_google_token = None
+            fresh_icloud_token = None
+            
+            try:
+                fresh_google_token = await self.google_service.get_sync_token(google_calendar_id)
+                self.logger.info(f"✅ Fresh Google token acquired: {fresh_google_token[:50] if fresh_google_token else 'None'}...")
+            except Exception as e:
+                self.logger.warning(f"⚠️  Could not get fresh Google token: {e}")
+                
+            try:
+                fresh_icloud_token = await self.icloud_service.get_sync_token(icloud_calendar_id)
+                self.logger.info(f"✅ Fresh iCloud token acquired: {fresh_icloud_token[:50] if fresh_icloud_token else 'None'}...")
+            except Exception as e:
+                self.logger.warning(f"⚠️  Could not get fresh iCloud token: {e}")
+            
+            # Compare tokens to detect race conditions
+            google_token_changed = (
+                fresh_google_token and 
+                initial_google_token and 
+                fresh_google_token != initial_google_token
+            )
+            
+            icloud_token_changed = (
+                fresh_icloud_token and 
+                initial_icloud_token and 
+                fresh_icloud_token != initial_icloud_token
+            )
+            
+            race_condition_detected = google_token_changed or icloud_token_changed
+            
+            if race_condition_detected:
+                self.logger.warning("🚨 RACE CONDITION DETECTED!")
+                self.logger.warning(f"  📊 Google token changed: {'✅' if google_token_changed else '❌'}")
+                self.logger.warning(f"  📊 iCloud token changed: {'✅' if icloud_token_changed else '❌'}")
+                self.logger.warning("  📝 Events may have been created during sync processing")
+                
+                # Verify race condition by checking for recent events
+                race_condition_confirmed = await self._verify_race_condition(
+                    google_calendar_id, icloud_calendar_id, sync_start_time, post_sync_time
+                )
+                
+                if race_condition_confirmed and not dry_run:
+                    self.logger.warning("🔧 RACE CONDITION CONFIRMED - Triggering automatic recovery...")
+                    await self._handle_race_condition_recovery(
+                        google_calendar_id, icloud_calendar_id, calendar_mapping
+                    )
+                else:
+                    self.logger.info("✅ Race condition false alarm - no recent events found")
+            else:
+                self.logger.info("✅ No race condition detected - tokens stable")
+            
+            # Check for incomplete incremental sync and schedule recovery if needed
+            incomplete_sync_detected = await self._detect_incomplete_incremental_sync(
+                google_calendar_id, icloud_calendar_id, calendar_mapping, sync_start_time
+            )
+            
+            if incomplete_sync_detected and not dry_run:
+                self.logger.warning("🔧 INCOMPLETE SYNC DETECTED - Scheduling full sync recovery...")
+                await self._handle_race_condition_recovery(
+                    google_calendar_id, icloud_calendar_id, calendar_mapping
+                )
+            
+            # Update calendar mapping with final fresh tokens if we have them
+            if not incomplete_sync_detected and (fresh_google_token or fresh_icloud_token):
+                await self._update_fresh_sync_tokens(
+                    calendar_mapping, fresh_google_token, fresh_icloud_token, dry_run
+                )
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error in post-sync race condition check: {type(e).__name__}: {e}")
+            # Don't fail the entire sync for race condition check failures
+        
+        self.logger.info("✅ POST-SYNC RACE CONDITION CHECK: Complete")
+    
+    async def _verify_race_condition(
+        self,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        sync_start_time: datetime,
+        sync_end_time: datetime
+    ) -> bool:
+        """Verify if a race condition actually occurred by checking for recent events.
+        
+        Args:
+            google_calendar_id: Google calendar ID
+            icloud_calendar_id: iCloud calendar ID
+            sync_start_time: When sync processing began
+            sync_end_time: When sync processing ended
+            
+        Returns:
+            True if race condition is confirmed (events created during sync)
+        """
+        self.logger.info("🔬 RACE CONDITION VERIFICATION: Checking for events created during sync...")
+        
+        try:
+            recent_events_found = False
+            
+            # Check Google for events created during sync window
+            try:
+                # Use a small time buffer to account for clock skew
+                buffer = timedelta(minutes=1)
+                search_start = sync_start_time - buffer
+                search_end = sync_end_time + buffer
+                
+                google_events = 0
+                async for event in self.google_service.get_events(
+                    google_calendar_id,
+                    time_min=search_start,
+                    time_max=search_end,
+                    max_results=50,
+                    updated_min=search_start
+                ):
+                    google_events += 1
+                    # Check if event was created during our sync window
+                    if event.created and search_start <= event.created <= search_end:
+                        self.logger.warning(f"  🚨 Google event created during sync: '{event.summary}' at {event.created}")
+                        recent_events_found = True
+                        
+                self.logger.info(f"  📊 Google events checked: {google_events}")
+                        
+            except Exception as e:
+                self.logger.warning(f"⚠️  Error checking Google events: {e}")
+            
+            # Check iCloud for events created during sync window  
+            try:
+                icloud_events = 0
+                async for event in self.icloud_service.get_events(
+                    icloud_calendar_id,
+                    time_min=search_start,
+                    time_max=search_end,
+                    max_results=50,
+                    updated_min=search_start
+                ):
+                    icloud_events += 1
+                    # Check if event was created during our sync window
+                    if event.created and search_start <= event.created <= search_end:
+                        self.logger.warning(f"  🚨 iCloud event created during sync: '{event.summary}' at {event.created}")
+                        recent_events_found = True
+                        
+                self.logger.info(f"  📊 iCloud events checked: {icloud_events}")
+                        
+            except Exception as e:
+                self.logger.warning(f"⚠️  Error checking iCloud events: {e}")
+            
+            if recent_events_found:
+                self.logger.warning("🔴 RACE CONDITION CONFIRMED: Events were created during sync processing")
+            else:
+                self.logger.info("🟢 RACE CONDITION FALSE ALARM: No events created during sync window")
+                
+            return recent_events_found
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error verifying race condition: {e}")
+            # Assume race condition to be safe
+            return True
+    
+    async def _handle_race_condition_recovery(
+        self,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        calendar_mapping: CalendarMappingDB
+    ) -> None:
+        """Handle automatic recovery from detected race conditions.
+        
+        Args:
+            google_calendar_id: Google calendar ID
+            icloud_calendar_id: iCloud calendar ID
+            calendar_mapping: Calendar mapping from database
+        """
+        self.logger.info("🔧 RACE CONDITION RECOVERY: Starting automatic recovery process...")
+        
+        try:
+            # Strategy: Clear sync tokens to force full sync on next run
+            # This ensures any events created during sync processing will be detected
+            
+            with self.db_manager.get_session() as session:
+                # Refresh the mapping in this session
+                mapping = session.merge(calendar_mapping)
+                
+                old_google_token = mapping.google_sync_token
+                old_icloud_token = mapping.icloud_sync_token
+                
+                # Clear sync tokens to force full sync
+                mapping.google_sync_token = None
+                mapping.icloud_sync_token = None
+                mapping.google_last_updated = datetime.now(pytz.UTC)
+                mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                
+                session.commit()
+                
+                # Update in-memory object
+                calendar_mapping.google_sync_token = None
+                calendar_mapping.icloud_sync_token = None
+                calendar_mapping.google_last_updated = mapping.google_last_updated
+                calendar_mapping.icloud_last_updated = mapping.icloud_last_updated
+                
+                self.logger.info("🧹 RACE CONDITION RECOVERY: Cleared sync tokens to force full sync")
+                self.logger.info(f"  📊 Cleared Google token: {old_google_token[:50] if old_google_token else 'None'}...")
+                self.logger.info(f"  📊 Cleared iCloud token: {old_icloud_token[:50] if old_icloud_token else 'None'}...")
+                self.logger.info("  🔄 Next sync will perform full synchronization")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error in race condition recovery: {type(e).__name__}: {e}")
+    
+    async def _update_fresh_sync_tokens(
+        self,
+        calendar_mapping: CalendarMappingDB,
+        fresh_google_token: Optional[str],
+        fresh_icloud_token: Optional[str],
+        dry_run: bool
+    ) -> None:
+        """Update calendar mapping with fresh sync tokens from post-processing.
+        
+        Args:
+            calendar_mapping: Calendar mapping from database
+            fresh_google_token: Fresh Google sync token
+            fresh_icloud_token: Fresh iCloud sync token
+            dry_run: Whether this is a dry run
+        """
+        if dry_run:
+            self.logger.info("🔍 DRY RUN: Would update fresh sync tokens")
+            return
+            
+        if not fresh_google_token and not fresh_icloud_token:
+            self.logger.info("⏭️  No fresh tokens to update")
+            return
+        
+        try:
+            with self.db_manager.get_session() as session:
+                # Refresh the mapping in this session
+                mapping = session.merge(calendar_mapping)
+                
+                if fresh_google_token and fresh_google_token != mapping.google_sync_token:
+                    old_token = mapping.google_sync_token
+                    mapping.google_sync_token = fresh_google_token
+                    mapping.google_last_updated = datetime.now(pytz.UTC)
+                    self.logger.info(f"🔄 Updated Google sync token (post-processing)")
+                    self.logger.info(f"  📊 Old: {old_token[:50] if old_token else 'None'}...")
+                    self.logger.info(f"  📊 New: {fresh_google_token[:50]}...")
+                
+                if fresh_icloud_token and fresh_icloud_token != mapping.icloud_sync_token:
+                    old_token = mapping.icloud_sync_token
+                    mapping.icloud_sync_token = fresh_icloud_token
+                    mapping.icloud_last_updated = datetime.now(pytz.UTC)
+                    self.logger.info(f"🔄 Updated iCloud sync token (post-processing)")
+                    self.logger.info(f"  📊 Old: {old_token if old_token else 'None'}")
+                    self.logger.info(f"  📊 New: {fresh_icloud_token}")
+                
+                session.commit()
+                
+                # Update in-memory object
+                calendar_mapping.google_sync_token = mapping.google_sync_token
+                calendar_mapping.icloud_sync_token = mapping.icloud_sync_token
+                calendar_mapping.google_last_updated = mapping.google_last_updated
+                calendar_mapping.icloud_last_updated = mapping.icloud_last_updated
+                
+                self.logger.info("✅ Fresh sync tokens updated successfully")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error updating fresh sync tokens: {type(e).__name__}: {e}")
+    
+    async def _detect_incomplete_incremental_sync(
+        self,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        calendar_mapping: CalendarMappingDB,
+        sync_start_time: datetime
+    ) -> bool:
+        """Detect if incremental sync appears to have missed events.
+        
+        This method performs sanity checks to determine if the incremental sync
+        may have missed events due to timing issues, token problems, or API limitations.
+        
+        Args:
+            google_calendar_id: Google calendar ID
+            icloud_calendar_id: iCloud calendar ID
+            calendar_mapping: Calendar mapping from database
+            sync_start_time: When sync processing began
+            
+        Returns:
+            True if incomplete sync is detected and full sync should be triggered
+        """
+        self.logger.info("🔍 INCOMPLETE SYNC DETECTION: Checking for missed events...")
+        
+        try:
+            # Only check if we're using sync tokens (incremental sync mode)
+            has_tokens = calendar_mapping.google_sync_token or calendar_mapping.icloud_sync_token
+            if not has_tokens:
+                self.logger.info("  ⏭️  Skipping incomplete sync check - already using full sync mode")
+                return False
+            
+            incomplete_detected = False
+            
+            # Check 1: Look for events that should have been synced but weren't
+            # This happens when sync tokens miss events due to timing issues
+            await self._check_for_unsynced_recent_events(
+                google_calendar_id, icloud_calendar_id, sync_start_time
+            )
+            
+            # Check 2: Verify sync token freshness - stale tokens indicate missed changes
+            token_freshness_issues = await self._check_sync_token_freshness(
+                google_calendar_id, icloud_calendar_id, calendar_mapping
+            )
+            
+            if token_freshness_issues:
+                self.logger.warning("⚠️  SYNC TOKEN FRESHNESS ISSUES DETECTED")
+                incomplete_detected = True
+            
+            # Check 3: Look for event mappings that are out of sync with actual events
+            mapping_inconsistencies = await self._check_event_mapping_consistency(
+                calendar_mapping, sync_start_time
+            )
+            
+            if mapping_inconsistencies:
+                self.logger.warning("⚠️  EVENT MAPPING INCONSISTENCIES DETECTED")
+                incomplete_detected = True
+            
+            if incomplete_detected:
+                self.logger.warning("🔴 INCOMPLETE INCREMENTAL SYNC DETECTED")
+                self.logger.warning("  📝 Recommendation: Force full sync to ensure data integrity")
+            else:
+                self.logger.info("✅ Incremental sync appears complete and accurate")
+                
+            return incomplete_detected
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error detecting incomplete sync: {e}")
+            # Assume incomplete sync to be safe
+            return True
+    
+    async def _check_for_unsynced_recent_events(
+        self,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        sync_start_time: datetime
+    ) -> bool:
+        """Check for recent events that should have been synced but weren't."""
+        self.logger.info("  🔍 Checking for unsynced recent events...")
+        
+        try:
+            # Look for events created/updated in the last few hours that might have been missed
+            lookback_window = timedelta(hours=2)
+            check_start = sync_start_time - lookback_window
+            
+            # Get recent Google events
+            google_recent = []
+            try:
+                async for event in self.google_service.get_events(
+                    google_calendar_id,
+                    time_min=check_start,
+                    time_max=sync_start_time,
+                    max_results=100,
+                    updated_min=check_start
+                ):
+                    google_recent.append(event)
+            except Exception as e:
+                self.logger.warning(f"    ⚠️  Could not check Google recent events: {e}")
+            
+            # Get recent iCloud events
+            icloud_recent = []
+            try:
+                async for event in self.icloud_service.get_events(
+                    icloud_calendar_id,
+                    time_min=check_start,
+                    time_max=sync_start_time,
+                    max_results=100,
+                    updated_min=check_start
+                ):
+                    icloud_recent.append(event)
+            except Exception as e:
+                self.logger.warning(f"    ⚠️  Could not check iCloud recent events: {e}")
+            
+            self.logger.info(f"    📊 Found {len(google_recent)} recent Google events, {len(icloud_recent)} recent iCloud events")
+            
+            # For now, just log the findings - more sophisticated detection could be added
+            if len(google_recent) > 50 or len(icloud_recent) > 50:
+                self.logger.warning(f"    ⚠️  High number of recent events - may indicate sync backlog")
+                return True
+                
+            return False
+            
+        except Exception as e:
+            self.logger.warning(f"    ❌ Error checking recent events: {e}")
+            return False
+    
+    async def _check_sync_token_freshness(
+        self,
+        google_calendar_id: str,
+        icloud_calendar_id: str,
+        calendar_mapping: CalendarMappingDB
+    ) -> bool:
+        """Check if sync tokens are stale indicating missed changes."""
+        self.logger.info("  🔍 Checking sync token freshness...")
+        
+        try:
+            stale_tokens = False
+            
+            # Check Google token freshness
+            if calendar_mapping.google_last_updated:
+                google_age = datetime.now(pytz.UTC) - calendar_mapping.google_last_updated
+                if google_age > timedelta(hours=6):
+                    self.logger.warning(f"    ⚠️  Google sync token is {google_age.total_seconds()/3600:.1f} hours old")
+                    stale_tokens = True
+            
+            # Check iCloud token freshness  
+            if calendar_mapping.icloud_last_updated:
+                icloud_age = datetime.now(pytz.UTC) - calendar_mapping.icloud_last_updated
+                if icloud_age > timedelta(hours=6):
+                    self.logger.warning(f"    ⚠️  iCloud sync token is {icloud_age.total_seconds()/3600:.1f} hours old")
+                    stale_tokens = True
+            
+            if not stale_tokens:
+                self.logger.info("    ✅ Sync tokens are fresh")
+                
+            return stale_tokens
+            
+        except Exception as e:
+            self.logger.warning(f"    ❌ Error checking token freshness: {e}")
+            return False
+    
+    async def _check_event_mapping_consistency(
+        self,
+        calendar_mapping: CalendarMappingDB,
+        sync_start_time: datetime
+    ) -> bool:
+        """Check for inconsistencies in event mappings."""
+        self.logger.info("  🔍 Checking event mapping consistency...")
+        
+        try:
+            with self.db_manager.get_session() as session:
+                # Look for mappings that haven't been updated recently but should have been
+                stale_mappings = session.query(EventMappingDB).filter(
+                    EventMappingDB.calendar_mapping_id == calendar_mapping.id,
+                    EventMappingDB.last_sync_at < sync_start_time - timedelta(hours=24)
+                ).limit(10).all()
+                
+                if stale_mappings:
+                    self.logger.warning(f"    ⚠️  Found {len(stale_mappings)} event mappings not updated in 24+ hours")
+                    return True
+                else:
+                    self.logger.info("    ✅ Event mappings appear consistent")
+                    return False
+                    
+        except Exception as e:
+            self.logger.warning(f"    ❌ Error checking mapping consistency: {e}")
+            return False
